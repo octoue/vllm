@@ -386,14 +386,17 @@ class OpenAIServingChat(OpenAIServing):
                     request_id if len(engine_prompts) == 1 else f"{request_id}_{i}"
                 )
 
-                max_tokens = get_max_tokens(
-                    self.max_model_len,
-                    request.max_completion_tokens
-                    if request.max_completion_tokens is not None
-                    else request.max_tokens,
-                    self._extract_prompt_len(engine_prompt),
-                    self.default_sampling_params,
-                )
+                if request.prefetch:
+                    max_tokens = 1
+                else:
+                    max_tokens = get_max_tokens(
+                        self.max_model_len,
+                        request.max_completion_tokens
+                        if request.max_completion_tokens is not None
+                        else request.max_tokens,
+                        self._extract_prompt_len(engine_prompt),
+                        self.default_sampling_params,
+                    )
 
                 sampling_params: SamplingParams | BeamSearchParams
                 if request.use_beam_search:
@@ -445,6 +448,7 @@ class OpenAIServingChat(OpenAIServing):
                         trace_headers=trace_headers,
                         priority=request.priority,
                         data_parallel_rank=data_parallel_rank,
+                        prefetch_only=request.prefetch,
                     )
                     reasoning_ended = None
                     if reasoning_parser:
@@ -470,6 +474,17 @@ class OpenAIServingChat(OpenAIServing):
 
         assert len(generators) == 1
         (result_generator,) = generators
+
+        if request.prefetch:
+            try:
+                return await self.chat_prefetch_response(
+                    result_generator,
+                    request_id,
+                    model_name,
+                    request_metadata,
+                )
+            except Exception as e:
+                return self.create_error_response(e)
 
         if request.stream:
             return self.chat_completion_stream_generator(
@@ -498,6 +513,49 @@ class OpenAIServingChat(OpenAIServing):
             return self._convert_generation_error_to_response(e)
         except ValueError as e:
             return self.create_error_response(e)
+
+    async def chat_prefetch_response(
+        self,
+        result_generator: AsyncIterator[RequestOutput],
+        request_id: str,
+        model_name: str,
+        request_metadata: RequestResponseMetadata,
+    ) -> ChatCompletionResponse:
+        """Consume the generator for a prefetch request and return a
+        simplified response. The engine executes the prefill, caches
+        the KV blocks via prefix caching, and finishes immediately."""
+
+        final_res: RequestOutput | None = None
+        async for res in result_generator:
+            final_res = res
+
+        assert final_res is not None
+
+        num_prompt_tokens = len(final_res.prompt_token_ids)
+        cached_tokens = getattr(final_res, "num_cached_tokens", None) or 0
+
+        usage = UsageInfo(
+            prompt_tokens=num_prompt_tokens,
+            total_tokens=num_prompt_tokens,
+            completion_tokens=0,
+            prompt_tokens_details=PromptTokenUsageInfo(
+                cached_tokens=cached_tokens,
+            ),
+        )
+        request_metadata.final_usage_info = usage
+
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content=None),
+            finish_reason="stop",
+        )
+        return ChatCompletionResponse(
+            id=request_id,
+            created=int(time.time()),
+            model=model_name,
+            choices=[choice],
+            usage=usage,
+        )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:

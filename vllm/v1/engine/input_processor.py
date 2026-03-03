@@ -531,6 +531,7 @@ class InputProcessor:
         data_parallel_rank: int | None = None,
         supported_tasks: tuple[SupportedTask, ...] | None = None,
         resumable: bool = False,
+        prefetch_only: bool = False,
     ) -> EngineCoreRequest:
         self._validate_lora(lora_request)
         self._validate_params(params, supported_tasks)
@@ -668,6 +669,7 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            prefetch_only=prefetch_only,
         )
 
     def _validate_model_inputs(

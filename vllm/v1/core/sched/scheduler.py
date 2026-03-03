@@ -1332,8 +1332,14 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
+            # Prefetch-only: finish immediately after prefill, discard tokens.
+            if request.prefetch_only:
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
+                new_token_ids = []
+
             # Check for stop and update request status.
-            if new_token_ids:
+            elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )

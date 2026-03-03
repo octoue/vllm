@@ -74,6 +74,7 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        prefetch_only: bool = False,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -173,6 +174,9 @@ class Request:
 
         # Used for streaming
         self.resumable = resumable
+
+        # If true, only compute KV cache (prefill) without generating tokens.
+        self.prefetch_only = prefetch_only
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
@@ -199,6 +203,7 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            prefetch_only=request.prefetch_only,
         )
 
     def append_output_token_ids(

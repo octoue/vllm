@@ -340,6 +340,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
+    prefetch: bool = Field(
+        default=False,
+        description=(
+            "If true, this request only pre-computes the KV cache for the "
+            "given messages without generating tokens. Used to warm up "
+            "context during user thinking time in multi-turn conversations. "
+            "Requires prefix caching to be enabled."
+        ),
+    )
+
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
         description=(
