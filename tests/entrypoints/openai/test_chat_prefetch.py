@@ -6,7 +6,14 @@ The prefetch feature lets clients pre-compute the KV cache for a
 conversation history while the user is still typing.  When the real
 request arrives with the same prefix, it benefits from prefix-cache
 hits and has a lower TTFT.
+
+Environment:
+  VLLM_PREFETCH_TEST_MODEL: Override model path (default: local Qwen3-8B)
+  VLLM_PREFETCH_TEST_GPU: Override GPU selection (default: auto-detect most idle)
 """
+
+import os
+import subprocess
 
 import openai
 import pytest
@@ -14,7 +21,47 @@ import pytest_asyncio
 
 from ...utils import RemoteOpenAIServer
 
-MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+# 本地模型路径，可通过环境变量覆盖
+MODEL_PATH = os.environ.get(
+    "VLLM_PREFETCH_TEST_MODEL",
+    "/lpai/models/Qwen__Qwen3-8B/25-07-26-0349",
+)
+
+
+def _get_most_idle_gpu() -> str:
+    """选择显存最空闲的一张 GPU。"""
+    gpu_override = os.environ.get("VLLM_PREFETCH_TEST_GPU")
+    if gpu_override is not None:
+        return str(gpu_override)
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
+        if not lines:
+            return "0"
+        # 解析 "0, 12345" 格式，按空闲显存降序排序
+        gpus = []
+        for line in lines:
+            parts = line.split(",", 1)
+            if len(parts) == 2:
+                idx = int(parts[0].strip())
+                free = int(parts[1].strip())
+                gpus.append((idx, free))
+        if not gpus:
+            return "0"
+        gpus.sort(key=lambda x: x[1], reverse=True)
+        return str(gpus[0][0])
+    except Exception:
+        return "0"
 
 HISTORY_MESSAGES = [
     {"role": "system", "content": "You are a helpful assistant."},
@@ -57,7 +104,14 @@ def default_server_args():
 
 @pytest.fixture(scope="module")
 def server(default_server_args):
-    with RemoteOpenAIServer(MODEL_NAME, default_server_args) as remote_server:
+    env_dict = {"HF_HUB_OFFLINE": "1"}
+    env_dict["CUDA_VISIBLE_DEVICES"] = _get_most_idle_gpu()
+    with RemoteOpenAIServer(
+        MODEL_PATH,
+        default_server_args,
+        env_dict=env_dict,
+        max_wait_seconds=360,
+    ) as remote_server:
         yield remote_server
 
 
@@ -78,13 +132,13 @@ async def test_prefetch_returns_valid_response(
     ChatCompletionResponse with completion_tokens == 0."""
 
     response = await client.chat.completions.create(
-        model=MODEL_NAME,
+        model=MODEL_PATH,
         messages=HISTORY_MESSAGES,
         extra_body={"prefetch": True},
     )
 
     assert response.id is not None
-    assert response.model == MODEL_NAME
+    assert response.model is not None
     assert len(response.choices) == 1
 
     choice = response.choices[0]
@@ -108,7 +162,7 @@ async def test_prefetch_populates_prefix_cache(
 
     # Step 1: prefetch the conversation history
     prefetch_resp = await client.chat.completions.create(
-        model=MODEL_NAME,
+        model=MODEL_PATH,
         messages=HISTORY_MESSAGES,
         extra_body={"prefetch": True},
     )
@@ -121,7 +175,7 @@ async def test_prefetch_populates_prefix_cache(
         {"role": "user", "content": "Can you summarize that in one sentence?"},
     ]
     real_resp = await client.chat.completions.create(
-        model=MODEL_NAME,
+        model=MODEL_PATH,
         messages=real_messages,
         max_tokens=32,
     )
@@ -154,7 +208,7 @@ async def test_prefetch_no_generated_content(
     """Prefetch should not produce any meaningful generated text."""
 
     response = await client.chat.completions.create(
-        model=MODEL_NAME,
+        model=MODEL_PATH,
         messages=[
             {"role": "user", "content": "Hello, how are you?"},
         ],

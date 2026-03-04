@@ -1,29 +1,32 @@
-# HF_ENDPOINT=https://hf-mirror.com CUDA_VISIBLE_DEVICES=0,1 vllm serve --model Qwen/Qwen2.5-72B-Instruct --host 0.0.0.0 --port 8000 --max-num-seqs 256 --block-size 16 --tensor-parallel-size 2 --pipeline-parallel-size 1 --gpu-memory-utilization 0.95  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_cpu_blocks": 25600}}' --enable-prefix-caching --trust-remote-code --disable-hybrid-kv-cache-manager | tee vllm_state.log
+#!/bin/bash
+# vLLM 启动脚本 - 使用本地模型、离线模式、自动选择最空闲 GPU
+# 模型: Qwen3-8B (单卡)
+# 用法: ./start_vllm.sh
 
-# --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_cpu_blocks": <num_cpu_blocks>}}'
+set -e
 
-# /root/.cache/huggingface/hub/models--Qwen--Qwen2.5-72B-Instruct
+# 本地模型路径
+MODEL_PATH="/lpai/models/Qwen__Qwen3-8B/25-07-26-0349"
 
-# --kv-offloading-backend native --kv_offloading_size 8 
+# 自动选择显存最空闲的 1 张 GPU（8B 模型单卡即可）
+FREE_GPUS=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null | \
+  sort -t',' -k2 -rn | head -n 1 | cut -d',' -f1 | tr -d ' ')
+if [ -z "$FREE_GPUS" ]; then
+  echo "Warning: nvidia-smi failed, using CUDA_VISIBLE_DEVICES=0"
+  FREE_GPUS=0
+fi
+echo "Selected GPU(s): $FREE_GPUS"
 
-  # --model /lpai/models/Qwen__Qwen3-32B/25-07-26-0345 \
-
-FREE_GPUS=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | sort -n -k2 -r | head -n 2 | cut -d ',' -f 1 | xargs | sed 's/ /,/g')
-echo "Selected GPUs: $FREE_GPUS"
-
-# 设定 CPU KV Cache 允许使用的最大内存字节数，这里设置为 50GB (50 * 1024^3 = 53687091200)
-CPU_BYTES=53687091200
-
+# 启动 vLLM（HF_HUB_OFFLINE=1 使用本地模型，不联网）
 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS vllm serve \
-  --model /lpai/models/Qwen__Qwen3-8B/25-07-26-0349 \
+  --model "$MODEL_PATH" \
   --host 0.0.0.0 \
   --port 8000 \
   --max-num-seqs 256 \
   --block-size 16 \
-  --tensor-parallel-size 2 \
-  --pipeline-parallel-size 1 \
-  --gpu-memory-utilization 0.8 \
-  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"num_cpu_blocks\": 25600, \"cpu_bytes_to_use\": $CPU_BYTES}}" \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.9 \
   --enable-prefix-caching \
+  --enable-prompt-tokens-details \
   --trust-remote-code \
-  --disable-hybrid-kv-cache-manager | tee vllm_state.log
+  | tee vllm_state.log
