@@ -17,6 +17,17 @@ if [ -z "$FREE_GPUS" ]; then
 fi
 echo "Selected GPU(s): $FREE_GPUS"
 
+# KV offloading (可选): 启用后 prefetch 可从 CPU 加载 KV 到 GPU
+# 用法: KV_OFFLOADING_SIZE=2 ./start_vllm.sh
+KV_OFFLOADING_SIZE="${KV_OFFLOADING_SIZE:-0}"
+
+EXTRA_ARGS=()
+if [ -n "$KV_OFFLOADING_SIZE" ] && [ "$KV_OFFLOADING_SIZE" != "0" ]; then
+  EXTRA_ARGS+=(--kv-offloading-size "$KV_OFFLOADING_SIZE")
+  EXTRA_ARGS+=(--kv-offloading-backend "native")
+  echo "KV Offloading enabled: ${KV_OFFLOADING_SIZE} GiB"
+fi
+
 # 启动 vLLM（HF_HUB_OFFLINE=1 使用本地模型，不联网）
 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS vllm serve \
   --model "$MODEL_PATH" \
@@ -29,4 +40,5 @@ HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS vllm serve \
   --enable-prefix-caching \
   --enable-prompt-tokens-details \
   --trust-remote-code \
+  "${EXTRA_ARGS[@]}" \
   | tee vllm_state.log

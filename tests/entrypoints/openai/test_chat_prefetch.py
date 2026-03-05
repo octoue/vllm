@@ -157,10 +157,21 @@ async def test_prefetch_returns_valid_response(
 async def test_prefetch_populates_prefix_cache(
     client: openai.AsyncOpenAI,
 ):
-    """After a prefetch, a follow-up request with the same history
-    should report cached_tokens in prompt_tokens_details."""
+    """After populating the cache and prefetching, a follow-up request
+    with the same history should report cached_tokens in prompt_tokens_details.
 
-    # Step 1: prefetch the conversation history
+    Prefetch only loads KV from cache (GPU or CPU); it does not compute.
+    So we first run a normal request to populate the prefix cache, then
+    prefetch (hits GPU cache), then the follow-up (hits cache)."""
+
+    # Step 1: run a normal request to populate prefix cache with the history
+    _ = await client.chat.completions.create(
+        model=MODEL_PATH,
+        messages=HISTORY_MESSAGES,
+        max_tokens=8,
+    )
+
+    # Step 2: prefetch the same conversation history (hits GPU cache)
     prefetch_resp = await client.chat.completions.create(
         model=MODEL_PATH,
         messages=HISTORY_MESSAGES,
@@ -170,7 +181,7 @@ async def test_prefetch_populates_prefix_cache(
     prefetch_prompt_tokens = prefetch_resp.usage.prompt_tokens
     assert prefetch_prompt_tokens > 0
 
-    # Step 2: send a real request with the same history + new user message
+    # Step 3: send a real request with the same history + new user message
     real_messages = HISTORY_MESSAGES + [
         {"role": "user", "content": "Can you summarize that in one sentence?"},
     ]
@@ -186,8 +197,8 @@ async def test_prefetch_populates_prefix_cache(
     assert real_resp.choices[0].message.content is not None
 
     # The real request should have a prefix cache hit for the history
-    # portion.  cached_tokens should be > 0 (the exact count depends
-    # on block alignment, so we just check it's positive).
+    # portion (populated by step 1 and kept warm by prefetch in step 2).
+    # cached_tokens should be > 0 (the exact count depends on block alignment).
     details = real_resp.usage.prompt_tokens_details
     assert details is not None, (
         "prompt_tokens_details should be present "

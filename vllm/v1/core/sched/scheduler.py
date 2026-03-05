@@ -47,7 +47,12 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    FinishReason,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -171,6 +176,12 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+
+        # Prefetch: outputs for requests that finish in the scheduler without
+        # model execution (no GPU compute).
+        self._prefetch_early_outputs: dict[int, list[EngineCoreOutput]] = (
+            defaultdict(list)
+        )
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -542,6 +553,11 @@ class Scheduler(SchedulerInterface):
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
                     if is_ready:
+                        if request.prefetch_only:
+                            # Prefetch: KV load complete, finish immediately.
+                            self.waiting.pop_request()
+                            self._finish_prefetch_request(request)
+                            continue
                         if request.num_preemptions:
                             # We must be loading for a resumed preemption
                             # rather than a new request.
@@ -635,6 +651,23 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                # Prefetch: never do GPU compute. Finish or discard in scheduler.
+                if request.prefetch_only:
+                    if num_external_computed_tokens > 0 and load_kv_async:
+                        # CPU offload hit: let it proceed to allocate + load.
+                        pass
+                    elif num_computed_tokens > 0:
+                        # GPU prefix cache hit: already in GPU, finish immediately.
+                        self.waiting.pop_request()
+                        request.num_cached_tokens = num_computed_tokens
+                        self._finish_prefetch_request(request)
+                        continue
+                    else:
+                        # No hit in GPU or CPU: discard request.
+                        self.waiting.pop_request()
+                        self._finish_prefetch_request(request)
+                        continue
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -1332,12 +1365,6 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
-            # Prefetch-only: finish immediately after prefill, discard tokens.
-            if request.prefetch_only:
-                request.status = RequestStatus.FINISHED_STOPPED
-                stopped = True
-                new_token_ids = []
-
             # Check for stop and update request status.
             elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -1440,6 +1467,12 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
+
+        # Prefetch: include outputs for requests that finished in scheduler
+        # without model execution.
+        for client_index, early_outs in self._prefetch_early_outputs.items():
+            outputs[client_index].extend(early_outs)
+        self._prefetch_early_outputs.clear()
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
@@ -1742,6 +1775,34 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
+    def _finish_prefetch_request(self, request: Request) -> None:
+        """Finish a prefetch_only request without GPU compute.
+
+        Prefetch requests never enter model execution. They either load KV
+        from CPU via PCIe and finish, or are discarded when no cache hit.
+        """
+        request.status = RequestStatus.FINISHED_STOPPED
+        output = EngineCoreOutput(
+            request_id=request.request_id,
+            new_token_ids=[],
+            finish_reason=FinishReason.STOP,
+            events=request.take_events(),
+            trace_headers=request.trace_headers,
+            num_cached_tokens=request.num_cached_tokens,
+        )
+        self._prefetch_early_outputs[request.client_index].append(output)
+        try:
+            self._free_request(request)
+        except KeyError:
+            # Request never got blocks (GPU hit or no hit); do minimal cleanup.
+            self.encoder_cache_manager.free(request)
+            self.finished_req_ids.add(request.request_id)
+            if self.finished_req_ids_dict is not None:
+                self.finished_req_ids_dict[request.client_index].add(
+                    request.request_id
+                )
+            del self.requests[request.request_id]
+
     def get_num_unfinished_requests(self) -> int:
         num_waiting = len(self.waiting) - self.num_waiting_for_streaming_input
         return num_waiting + len(self.running)
@@ -1961,7 +2022,8 @@ class Scheduler(SchedulerInterface):
             # Handle the case where num request tokens less than one block.
             num_computed_tokens = min(num_computed_tokens, request.num_tokens)
             if num_computed_tokens == request.num_tokens:
-                num_computed_tokens -= 1
+                if not request.prefetch_only:
+                    num_computed_tokens -= 1
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, num_computed_tokens)
 

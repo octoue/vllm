@@ -405,6 +405,10 @@ class OffloadingConnectorScheduler:
         reqs_to_store: dict[ReqId, TransferSpec] = {}
         # iterate over both new and cached requests
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
+            req = self._requests.get(req_id)
+            if req is not None and req.prefetch_only:
+                # Prefetch requests only load KV, they produce no new data to store.
+                continue
             if preempted:
                 self._request_block_ids[req_id] = []
 
