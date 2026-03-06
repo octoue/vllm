@@ -121,6 +121,17 @@ async def client(server):
         yield async_client
 
 
+def _assert_no_error_response(response, context: str = ""):
+    """Fail with a clear message if the response contains an error."""
+    if hasattr(response, "error") and response.error is not None:
+        err = response.error
+        msg = getattr(err, "message", str(err))
+        err_type = getattr(err, "type", "Unknown")
+        pytest.fail(
+            f"{context}Prefetch request failed with {err_type}: {msg}"
+        )
+
+
 # ------------------------------------------------------------------
 # Test 1: Basic prefetch request returns a valid response
 # ------------------------------------------------------------------
@@ -136,6 +147,7 @@ async def test_prefetch_returns_valid_response(
         messages=HISTORY_MESSAGES,
         extra_body={"prefetch": True},
     )
+    _assert_no_error_response(response, "test_prefetch_returns_valid_response: ")
 
     assert response.id is not None
     assert response.model is not None
@@ -177,6 +189,7 @@ async def test_prefetch_populates_prefix_cache(
         messages=HISTORY_MESSAGES,
         extra_body={"prefetch": True},
     )
+    _assert_no_error_response(prefetch_resp, "test_prefetch_populates_prefix_cache: ")
     assert prefetch_resp.usage is not None
     prefetch_prompt_tokens = prefetch_resp.usage.prompt_tokens
     assert prefetch_prompt_tokens > 0
@@ -225,6 +238,8 @@ async def test_prefetch_no_generated_content(
         ],
         extra_body={"prefetch": True},
     )
+    _assert_no_error_response(response, "test_prefetch_no_generated_content: ")
+    assert response.choices is not None and len(response.choices) > 0
 
     choice = response.choices[0]
     # content should be None (no tokens generated)

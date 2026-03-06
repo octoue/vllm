@@ -531,7 +531,7 @@ class OpenAIServingChat(OpenAIServing):
 
         assert final_res is not None
 
-        num_prompt_tokens = len(final_res.prompt_token_ids)
+        num_prompt_tokens = len(final_res.prompt_token_ids or [])
         cached_tokens = getattr(final_res, "num_cached_tokens", None) or 0
 
         usage = UsageInfo(

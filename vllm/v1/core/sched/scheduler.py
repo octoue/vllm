@@ -666,6 +666,7 @@ class Scheduler(SchedulerInterface):
                     else:
                         # No hit in GPU or CPU: discard request.
                         self.waiting.pop_request()
+                        request.num_cached_tokens = 0
                         self._finish_prefetch_request(request)
                         continue
 
