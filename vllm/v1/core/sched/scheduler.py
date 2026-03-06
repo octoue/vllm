@@ -1366,7 +1366,7 @@ class Scheduler(SchedulerInterface):
             status_before_stop = request.status
 
             # Check for stop and update request status.
-            elif new_token_ids:
+            if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
@@ -1472,6 +1472,10 @@ class Scheduler(SchedulerInterface):
         # without model execution.
         for client_index, early_outs in self._prefetch_early_outputs.items():
             outputs[client_index].extend(early_outs)
+            for out in early_outs:
+                self.finished_req_ids.add(out.request_id)
+                if self.finished_req_ids_dict is not None:
+                    self.finished_req_ids_dict[client_index].add(out.request_id)
         self._prefetch_early_outputs.clear()
 
         # KV Connector: update state for finished KV Transfers.
