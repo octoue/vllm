@@ -2034,6 +2034,8 @@ class Scheduler(SchedulerInterface):
 
             # Update the request state for scheduling.
             request.num_computed_tokens = num_computed_tokens
+            if request.num_cached_tokens < 0:
+                request.num_cached_tokens = num_computed_tokens
 
         # Return that we are ready.
         self.finished_recving_kv_req_ids.remove(request.request_id)
