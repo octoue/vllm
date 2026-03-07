@@ -174,17 +174,17 @@ async def _measure_ttft(
     """Measure TTFT: time from request start to first received chunk."""
     start = time.perf_counter()
     first_chunk_time: float | None = None
-    async with client.chat.completions.create(
+    stream = await client.chat.completions.create(
         model=model,
         messages=messages,
         max_tokens=32,
         stream=True,
-    ) as stream:
-        async for chunk in stream:
-            if first_chunk_time is None:
-                first_chunk_time = time.perf_counter()
-            if chunk.choices and chunk.choices[0].delta.content:
-                break
+    )
+    async for chunk in stream:
+        if first_chunk_time is None:
+            first_chunk_time = time.perf_counter()
+        if chunk.choices and chunk.choices[0].delta.content:
+            break
     if first_chunk_time is None:
         first_chunk_time = time.perf_counter()
     return first_chunk_time - start
