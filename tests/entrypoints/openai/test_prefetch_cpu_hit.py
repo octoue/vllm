@@ -117,23 +117,34 @@ def _fetch_metrics(metrics_url: str) -> str:
 
 
 def _parse_counter_flexible(metrics_text: str, name: str, label_filter: str) -> float:
-    """Parse counter by matching lines containing name and label_filter."""
+    """Parse counter by matching lines containing name and label_filter.
+
+    Uses case-insensitive matching for label_filter since Prometheus may use
+    'CPU_to_GPU' / 'GPU_to_CPU' (from vLLM transfer_type).
+    """
     total = 0.0
     for line in metrics_text.split("\n"):
         if line.strip().startswith("#"):
             continue
-        if name in line and label_filter in line:
-            parts = line.rsplit(None, 1)
-            if len(parts) == 2:
-                try:
-                    total += float(parts[1])
-                except ValueError:
-                    pass
+        if name not in line:
+            continue
+        if label_filter and label_filter.lower() not in line.lower():
+            continue
+        parts = line.rsplit(None, 1)
+        if len(parts) == 2:
+            try:
+                total += float(parts[1])
+            except ValueError:
+                pass
     return total
 
 
 def _get_metrics_snapshot_flexible(metrics_url: str) -> dict[str, float]:
-    """Get metrics snapshot using flexible parsing (handles variable label order)."""
+    """Get metrics snapshot using flexible parsing (handles variable label order).
+
+    Note: Prometheus labels use 'GPU_to_CPU' and 'CPU_to_GPU' (from vLLM
+    transfer_type), so we match case-insensitively.
+    """
     text = _fetch_metrics(metrics_url)
     return {
         "kv_offload_gpu_to_cpu_bytes": _parse_counter_flexible(
@@ -269,7 +280,7 @@ async def test_prefetch_cpu_to_gpu_migration(
 
     m2 = _get_metrics_snapshot_flexible(metrics_url)
 
-    # Step 3: Baseline - gpu_to_cpu should have increased (store)
+    # Step 3: Baseline - gpu_to_cpu should have increased (store) after eviction
     assert m2["kv_offload_gpu_to_cpu_bytes"] >= m1["kv_offload_gpu_to_cpu_bytes"], (
         "Expected gpu_to_cpu store after eviction"
     )
@@ -298,10 +309,19 @@ async def test_prefetch_cpu_to_gpu_migration(
     m3 = _get_metrics_snapshot_flexible(metrics_url)
 
     # Step 4 verification: cpu_to_gpu bytes should have increased
-    assert m3["kv_offload_cpu_to_gpu_bytes"] > cpu_to_gpu_before, (
-        f"Expected cpu_to_gpu transfer after prefetch: "
-        f"before={cpu_to_gpu_before}, after={m3['kv_offload_cpu_to_gpu_bytes']}"
-    )
+    cpu_to_gpu_after = m3["kv_offload_cpu_to_gpu_bytes"]
+    if cpu_to_gpu_after <= cpu_to_gpu_before:
+        raw = _fetch_metrics(metrics_url)
+        kv_lines = [
+            l for l in raw.split("\n")
+            if "kv_offload" in l and not l.strip().startswith("#")
+        ]
+        pytest.fail(
+            f"Expected cpu_to_gpu transfer after prefetch: "
+            f"before={cpu_to_gpu_before}, after={cpu_to_gpu_after}. "
+            f"Prometheus uses transfer_type='CPU_to_GPU' or 'GPU_to_CPU'. "
+            f"KV offload lines: {kv_lines[:15]!r}"
+        )
 
     # Step 5: Real request with prefix A + new question
     real_messages = _make_messages(PARAGRAPH_A, "Can you summarize that in one sentence?")
