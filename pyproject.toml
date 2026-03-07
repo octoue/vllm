@@ -105,6 +105,7 @@ follow_imports = "silent"
 
 [tool.pytest.ini_options]
 markers = [
+    "slow: mark test as slow (e.g. TTFT comparison)",
     "slow_test",
     "skip_global_cleanup",
     "core_model: enable this model test in each PR instead of only nightly",
