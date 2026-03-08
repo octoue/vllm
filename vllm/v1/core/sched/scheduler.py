@@ -656,15 +656,30 @@ class Scheduler(SchedulerInterface):
                 if request.prefetch_only:
                     if num_external_computed_tokens > 0 and load_kv_async:
                         # CPU offload hit: let it proceed to allocate + load.
+                        logger.info(
+                            "Prefetch %s: CPU hit, loading %d tokens from offload",
+                            request_id,
+                            num_external_computed_tokens,
+                        )
                         pass
                     elif num_computed_tokens > 0:
                         # GPU prefix cache hit: already in GPU, finish immediately.
+                        logger.info(
+                            "Prefetch %s: GPU hit, %d tokens already cached",
+                            request_id,
+                            num_computed_tokens,
+                        )
                         self.waiting.pop_request()
                         request.num_cached_tokens = num_computed_tokens
                         self._finish_prefetch_request(request)
                         continue
                     else:
                         # No hit in GPU or CPU: discard request.
+                        logger.info(
+                            "Prefetch %s: NO HIT, discarding (tokens=%d)",
+                            request_id,
+                            request.num_tokens,
+                        )
                         self.waiting.pop_request()
                         request.num_cached_tokens = 0
                         self._finish_prefetch_request(request)

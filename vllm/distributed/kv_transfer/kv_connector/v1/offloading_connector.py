@@ -437,7 +437,11 @@ class OffloadingConnectorScheduler:
             store_output = self.manager.prepare_store(new_block_hashes)
             if store_output is None:
                 logger.warning(
-                    "Request %s: cannot store %s blocks", req_id, num_new_blocks
+                    "Request %s: cannot store %s blocks (offload buffer full or "
+                    "all blocks in use, ref_cnt>0; consider increasing "
+                    "kv_offloading_size)",
+                    req_id,
+                    num_new_blocks,
                 )
                 continue
 
