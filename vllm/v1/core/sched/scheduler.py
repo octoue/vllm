@@ -543,6 +543,12 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
+                logger.debug(
+                    "Schedule step: waiting=%d, running=%d, free_blocks=%d",
+                    len(self.waiting),
+                    len(self.running),
+                    self.kv_cache_manager.get_num_free_blocks(),
+                )
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -555,6 +561,13 @@ class Scheduler(SchedulerInterface):
                     if is_ready:
                         if request.prefetch_only:
                             # Prefetch: KV load complete, finish immediately.
+                            logger.info(
+                                "Prefetch %s: CPU load complete, cached %d tokens, "
+                                "free_blocks=%d",
+                                request_id,
+                                request.num_cached_tokens,
+                                self.kv_cache_manager.get_num_free_blocks(),
+                            )
                             self.waiting.pop_request()
                             self._finish_prefetch_request(request)
                             continue
@@ -772,7 +785,11 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
-
+                    logger.info(
+                        "Block allocation failed for %s: free_blocks=%d",
+                        request_id,
+                        self.kv_cache_manager.get_num_free_blocks(),
+                    )
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
                     if request.has_encoder_inputs:
@@ -805,6 +822,13 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    logger.info(
+                        "Request %s -> WAITING_FOR_REMOTE_KVS: loading %d external "
+                        "tokens, free_blocks=%d",
+                        request_id,
+                        num_external_computed_tokens,
+                        self.kv_cache_manager.get_num_free_blocks(),
+                    )
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     continue

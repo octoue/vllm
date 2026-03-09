@@ -323,13 +323,18 @@ class OffloadingConnectorScheduler:
             # indicates a lookup that should be tried later
             return None, False
         if hits == 0:
+            logger.info(
+                "Request %s: offload MISS (GPU tokens=%d)",
+                request.request_id,
+                num_computed_tokens,
+            )
             return 0, False
 
         num_hit_tokens = (
             self.offloaded_block_size * (start_block_idx + hits) - num_computed_tokens
         )
-        logger.debug(
-            "Request %s hit %s offloaded tokens after %s GPU hit tokens",
+        logger.info(
+            "Request %s: offload HIT %d tokens (after %d GPU tokens)",
             request.request_id,
             num_hit_tokens,
             num_computed_tokens,
@@ -397,6 +402,13 @@ class OffloadingConnectorScheduler:
         req_blocks_being_loaded = self._reqs_being_loaded[request.request_id]
         req_blocks_being_loaded.update(block_hashes)
         self._next_stored_block_idx[request.request_id] = num_blocks
+
+        logger.info(
+            "Request %s: scheduling CPU->GPU load of %d blocks (%d tokens)",
+            request.request_id,
+            num_pending_gpu_blocks,
+            num_external_tokens,
+        )
 
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(req_blocks_being_loaded)

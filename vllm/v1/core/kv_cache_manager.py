@@ -149,6 +149,10 @@ class KVCacheManager:
         """
         return self.block_pool.get_usage()
 
+    def get_num_free_blocks(self) -> int:
+        """Get the number of free blocks in the pool."""
+        return self.block_pool.get_num_free_blocks()
+
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
 
