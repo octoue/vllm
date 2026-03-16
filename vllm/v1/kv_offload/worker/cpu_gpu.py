@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import deque
 from dataclasses import dataclass
+import time
 
 import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.profiler.pcie_tracer import get_pcie_tracer
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionBackend
@@ -27,6 +29,7 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
+    label: str = "Offload"
 
 
 def expand_block_ids(
@@ -116,7 +119,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # list of CUDA events available for re-use
         self._event_pool: list[torch.Event] = []
 
-    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
+    def transfer_async(
+        self, job_id: int, transfer_spec: TransferSpec, label: str = "Offload"
+    ) -> bool:
         src_spec, dst_spec = transfer_spec
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
@@ -142,6 +147,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         expand_block_ids(dst_blocks, self.dst_block_size_factor, src_to_dst[:, 1])
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
+        direction = "D2H" if self.gpu_to_cpu else "H2D"
+        num_bytes = dst_sub_block_count * self.total_block_size_in_bytes
+
         stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
         start_event = (
             self._event_pool.pop()
@@ -162,20 +170,25 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             last_event = last_transfer.end_event
             # assure job will start only after the previous one completes
             stream.wait_event(last_event)
-        with torch.cuda.stream(stream):
-            start_event.record(stream)
-            for src_tensor, dst_tensor, block_size_in_bytes in zip(
-                self.src_tensors,
-                self.dst_tensors,
-                self.block_size_in_bytes,
-            ):
-                ops.swap_blocks(
-                    src_tensor,
-                    dst_tensor,
-                    block_size_in_bytes,
-                    src_to_dst_tensor,
+        with torch.profiler.record_function(f"KVCache_{label}_{direction}"):
+            with torch.cuda.stream(stream):
+                start_event.record(stream)
+                torch.cuda.nvtx.range_push(
+                    f"KVCache_{label}_{direction}_job{job_id}"
                 )
-            end_event.record(stream)
+                for src_tensor, dst_tensor, block_size_in_bytes in zip(
+                    self.src_tensors,
+                    self.dst_tensors,
+                    self.block_size_in_bytes,
+                ):
+                    ops.swap_blocks(
+                        src_tensor,
+                        dst_tensor,
+                        block_size_in_bytes,
+                        src_to_dst_tensor,
+                    )
+                torch.cuda.nvtx.range_pop()
+                end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
@@ -184,7 +197,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 stream=stream,
                 start_event=start_event,
                 end_event=end_event,
-                num_bytes=dst_sub_block_count * self.total_block_size_in_bytes,
+                num_bytes=num_bytes,
+                label=label,
             )
         )
 
@@ -205,6 +219,22 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 transfer_time=transfer_time,
                 transfer_type=self.transfer_type,
             )
+
+            # PCIeTracer: record event for Gantt visualization
+            tracer = get_pcie_tracer()
+            if tracer is not None and transfer_time > 0:
+                direction = "D2H" if self.gpu_to_cpu else "H2D"
+                end_us = time.perf_counter() * 1e6
+                start_us = end_us - transfer_time * 1e6
+                gpu_id = torch.cuda.current_device()
+                tracer.record_event(
+                    op_type=transfer.label,
+                    gpu_id=gpu_id,
+                    direction=direction,
+                    start_us=start_us,
+                    end_us=end_us,
+                    size_bytes=transfer.num_bytes,
+                )
 
             results.append(result)
             self._stream_pool.append(transfer.stream)

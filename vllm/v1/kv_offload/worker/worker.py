@@ -37,7 +37,9 @@ class OffloadingHandler(ABC):
     """
 
     @abstractmethod
-    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+    def transfer_async(
+        self, job_id: int, spec: TransferSpec, label: str = "Offload"
+    ) -> bool:
         """
         Initiates an asynchronous transfer of KV data.
 
@@ -45,6 +47,7 @@ class OffloadingHandler(ABC):
             job_id: a unique ID that will be used when notifying back on
                 transfer completion.
             spec: the (src, dst) spec of the KV data transfer.
+            label: operation label for profiling ("Evict", "Restore", "Prefetch").
 
         Returns:
             True if transfer was submitted successfully.
@@ -111,7 +114,9 @@ class OffloadingWorker:
         self.handlers.add(handler)
         self.transfer_type_to_handler[transfer_type] = handler
 
-    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+    def transfer_async(
+        self, job_id: int, spec: TransferSpec, label: str = "Offload"
+    ) -> bool:
         """
         Initiates an asynchronous transfer of KV data.
 
@@ -119,6 +124,7 @@ class OffloadingWorker:
             job_id: a unique ID that will be used when notifying back on
                 transfer completion.
             spec: the (src, dst) spec of the KV data transfer.
+            label: operation label for profiling ("Evict", "Restore", "Prefetch").
 
         Returns:
             True if transfer was submitted successfully.
@@ -128,7 +134,7 @@ class OffloadingWorker:
         handler = self.transfer_type_to_handler.get(transfer_type)
         assert handler is not None
         try:
-            success = handler.transfer_async(job_id, spec)
+            success = handler.transfer_async(job_id, spec, label=label)
         except Exception as e:
             logger.warning(
                 "Exception in %r transfer %d: %r",

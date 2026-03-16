@@ -25,7 +25,9 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import math
 import pickle
+import time
 import weakref
 from collections import namedtuple
 from collections.abc import Callable
@@ -43,6 +45,7 @@ import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup
 
 import vllm.envs as envs
+from vllm.profiler.pcie_tracer import get_pcie_tracer
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -841,31 +844,63 @@ class GroupCoordinator:
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
 
-        for key, tensor in zip(tensor_keys, tensor_list):
-            if tensor.numel() == 0:
-                # Skip sending empty tensors.
-                continue
+        total_gpu_bytes = sum(
+            t.numel() * t.element_size()
+            for t in tensor_list
+            if t.is_cuda and t.numel() > 0
+        )
+        with torch.profiler.record_function(
+            f"PP_Send_rank{self.rank_in_group}_to_{dst}"
+        ):
+            torch.cuda.nvtx.range_push(f"PP_Send_rank{self.rank_in_group}")
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            for key, tensor in zip(tensor_keys, tensor_list):
+                if tensor.numel() == 0:
+                    # Skip sending empty tensors.
+                    continue
 
-            # send-allgather: send only a slice, then do allgather.
-            use_all_gather = (
-                all_gather_group is not None and tensor.numel() % all_gather_size == 0
-            )
-            use_all_gather = (
-                all_gather_tensors.get(key, use_all_gather)
-                if all_gather_tensors
-                else use_all_gather
-            )
-            if use_all_gather:
-                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
-
-            if tensor.is_cpu:
-                # use metadata_group for CPU tensors
-                torch.distributed.send(
-                    tensor, dst=self.ranks[dst], group=metadata_group
+                # send-allgather: send only a slice, then do allgather.
+                use_all_gather = (
+                    all_gather_group is not None
+                    and tensor.numel() % all_gather_size == 0
                 )
-            else:
-                # use group for GPU tensors
-                torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
+                use_all_gather = (
+                    all_gather_tensors.get(key, use_all_gather)
+                    if all_gather_tensors
+                    else use_all_gather
+                )
+                if use_all_gather:
+                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+                if tensor.is_cpu:
+                    # use metadata_group for CPU tensors
+                    torch.distributed.send(
+                        tensor, dst=self.ranks[dst], group=metadata_group
+                    )
+                else:
+                    # use group for GPU tensors
+                    torch.distributed.send(
+                        tensor, dst=self.ranks[dst], group=group
+                    )
+            end_event.record()
+            torch.cuda.current_stream().synchronize()
+            torch.cuda.nvtx.range_pop()
+
+            tracer = get_pcie_tracer()
+            if tracer is not None and total_gpu_bytes > 0:
+                elapsed_ms = start_event.elapsed_time(end_event)
+                end_us = time.perf_counter() * 1e6
+                start_us = end_us - elapsed_ms * 1000
+                tracer.record_event(
+                    op_type="PP_Transfer",
+                    gpu_id=torch.cuda.current_device(),
+                    direction="P2P",
+                    start_us=start_us,
+                    end_us=end_us,
+                    size_bytes=total_gpu_bytes,
+                )
         return None
 
     def recv_tensor_dict(
@@ -915,48 +950,87 @@ class GroupCoordinator:
             )
 
         recv_metadata_list = self.recv_object(src=src)
-        tensor_dict: dict[str, Any] = {}
-        for key, value in recv_metadata_list:
-            if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
-                if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
+        total_gpu_bytes = sum(
+            math.prod(value.size) * torch.empty(1, dtype=value.dtype).element_size()
+            for key, value in recv_metadata_list
+            if isinstance(value, TensorMetadata)
+            and value.device == "cuda"
+            and math.prod(value.size) > 0
+        )
+        with torch.profiler.record_function(
+            f"PP_Recv_rank{self.rank_in_group}_from_{src}"
+        ):
+            torch.cuda.nvtx.range_push(f"PP_Recv_rank{self.rank_in_group}")
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            tensor_dict: dict[str, Any] = {}
+            for key, value in recv_metadata_list:
+                if isinstance(value, TensorMetadata):
+                    tensor = torch.empty(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
+                    if tensor.numel() == 0:
+                        # Skip broadcasting empty tensors.
+                        tensor_dict[key] = tensor
+                        continue
+
+                    # send-allgather: send only a slice, then do allgather.
+                    use_all_gather = (
+                        all_gather_group is not None
+                        and tensor.numel() % all_gather_size == 0
+                    )
+                    use_all_gather = (
+                        all_gather_tensors.get(key, use_all_gather)
+                        if all_gather_tensors
+                        else use_all_gather
+                    )
+
+                    if use_all_gather:
+                        orig_shape = tensor.shape
+                        tensor = tensor.reshape(all_gather_size, -1)[
+                            all_gather_rank
+                        ]
+
+                    if tensor.is_cpu:
+                        # use metadata_group for CPU tensors
+                        torch.distributed.recv(
+                            tensor,
+                            src=self.ranks[src],
+                            group=metadata_group,
+                        )
+                    else:
+                        # use group for GPU tensors
+                        torch.distributed.recv(
+                            tensor, src=self.ranks[src], group=group
+                        )
+                    if use_all_gather:
+                        # do the allgather
+                        tensor = all_gather_group.all_gather(  # type: ignore
+                            tensor, dim=0
+                        )
+                        tensor = tensor.reshape(orig_shape)
+
                     tensor_dict[key] = tensor
-                    continue
-
-                # send-allgather: send only a slice, then do allgather.
-                use_all_gather = (
-                    all_gather_group is not None
-                    and tensor.numel() % all_gather_size == 0
-                )
-                use_all_gather = (
-                    all_gather_tensors.get(key, use_all_gather)
-                    if all_gather_tensors
-                    else use_all_gather
-                )
-
-                if use_all_gather:
-                    orig_shape = tensor.shape
-                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
-
-                if tensor.is_cpu:
-                    # use metadata_group for CPU tensors
-                    torch.distributed.recv(
-                        tensor, src=self.ranks[src], group=metadata_group
-                    )
                 else:
-                    # use group for GPU tensors
-                    torch.distributed.recv(tensor, src=self.ranks[src], group=group)
-                if use_all_gather:
-                    # do the allgather
-                    tensor = all_gather_group.all_gather(  # type: ignore
-                        tensor, dim=0
-                    )
-                    tensor = tensor.reshape(orig_shape)
+                    tensor_dict[key] = value
+            end_event.record()
+            torch.cuda.current_stream().synchronize()
+            torch.cuda.nvtx.range_pop()
 
-                tensor_dict[key] = tensor
-            else:
-                tensor_dict[key] = value
+            tracer = get_pcie_tracer()
+            if tracer is not None and total_gpu_bytes > 0:
+                elapsed_ms = start_event.elapsed_time(end_event)
+                end_us = time.perf_counter() * 1e6
+                start_us = end_us - elapsed_ms * 1000
+                tracer.record_event(
+                    op_type="PP_Transfer",
+                    gpu_id=torch.cuda.current_device(),
+                    direction="P2P",
+                    start_us=start_us,
+                    end_us=end_us,
+                    size_bytes=total_gpu_bytes,
+                )
         return tensor_dict
 
     def barrier(self):

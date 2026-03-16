@@ -12,6 +12,7 @@ from typing_extensions import override
 from vllm.config import ProfilerConfig
 from vllm.config.profiler import _is_uri_path
 from vllm.logger import init_logger
+from vllm.profiler.pcie_tracer import get_pcie_tracer
 
 logger = init_logger(__name__)
 
@@ -227,6 +228,26 @@ class TorchProfilerWrapper(WorkerProfiler):
                     sort_by="self_cpu_time_total", row_limit=50
                 )
             )
+
+        # Save PCIeTracer events if enabled and profiler_dir is writable
+        tracer = get_pcie_tracer()
+        profiler_dir = self.profiler_config.torch_profiler_dir
+        if (
+            tracer is not None
+            and profiler_dir
+            and not _is_uri_path(profiler_dir)
+        ):
+            import os
+
+            os.makedirs(profiler_dir, exist_ok=True)
+            pcie_path = f"{profiler_dir}/pcie_events_{rank}.json"
+            try:
+                tracer.save_json(pcie_path)
+                logger.info_once(
+                    "PCIe events saved to %s", pcie_path, scope="local"
+                )
+            except Exception as e:
+                logger.warning("Failed to save PCIe events: %s", e)
 
     @override
     def annotate_context_manager(self, name: str):

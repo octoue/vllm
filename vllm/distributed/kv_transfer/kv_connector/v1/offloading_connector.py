@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any
 
@@ -111,6 +111,7 @@ class OffloadingConnectorStats(KVConnectorStats):
 class OffloadingConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: dict[ReqId, TransferSpec]
     reqs_to_store: dict[ReqId, TransferSpec]
+    prefetch_req_ids: set[ReqId] = field(default_factory=set)
 
 
 class OffloadingConnector(KVConnectorBase_V1):
@@ -495,9 +496,16 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        prefetch_req_ids = {
+            req_id
+            for req_id in self._reqs_to_load
+            if self._requests.get(req_id) is not None
+            and self._requests[req_id].prefetch_only
+        }
         meta = OffloadingConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_store=self._get_reqs_to_store(scheduler_output),
+            prefetch_req_ids=prefetch_req_ids,
         )
         self._reqs_to_load = {}
 
@@ -632,7 +640,9 @@ class OffloadingConnectorWorker:
 
     def handle_preemptions(self, preempted_req_ids: set[str]):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
+            success = self.worker.transfer_async(
+                job_id, transfer_spec, label="Evict"
+            )
             assert success
         self._unsubmitted_store_jobs.clear()
 
@@ -643,7 +653,9 @@ class OffloadingConnectorWorker:
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
+            success = self.worker.transfer_async(
+                job_id, transfer_spec, label="Evict"
+            )
             assert success
         self._unsubmitted_store_jobs.clear()
 
@@ -652,7 +664,10 @@ class OffloadingConnectorWorker:
             self._jobs[job_id] = (req_id, False)
             assert req_id not in self._load_job
             self._load_job[req_id] = job_id
-            success = self.worker.transfer_async(job_id, transfer_spec)
+            label = "Prefetch" if req_id in metadata.prefetch_req_ids else "Restore"
+            success = self.worker.transfer_async(
+                job_id, transfer_spec, label=label
+            )
             assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
