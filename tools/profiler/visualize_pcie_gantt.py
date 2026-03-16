@@ -72,6 +72,11 @@ def build_gantt(events: list[dict], output_path: str) -> None:
         set(f"GPU{e['gpu_id']}_{e['direction']}" for e in events),
         key=lambda s: (int(s.split("GPU")[1].split("_")[0]), s.split("_")[1]),
     )
+    # Total timeline span - bars can be invisible if events are short vs total range
+    max_time_ms = max(e["start_ms_norm"] + e["duration_ms"] for e in events)
+    # Default view: first 5 seconds or 10% of total, whichever is larger (min 500ms)
+    default_x_range = min(5000.0, max(500.0, max_time_ms * 0.1))
+
     fig.update_layout(
         yaxis=dict(
             categoryorder="array",
@@ -81,8 +86,14 @@ def build_gantt(events: list[dict], output_path: str) -> None:
         xaxis=dict(
             title="Time (ms)",
             type="linear",
+            range=[0, default_x_range],
+            rangeslider=dict(
+                visible=True,
+                range=[0, max_time_ms],
+                thickness=0.05,
+            ),
         ),
-        title="PCIe Bandwidth Usage",
+        title="PCIe Bandwidth Usage (use rangeslider below to zoom/pan)",
         barmode="overlay",
         height=400 + len(all_lanes) * 30,
         margin=dict(l=120),
