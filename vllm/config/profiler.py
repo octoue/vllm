@@ -13,7 +13,7 @@ from vllm.utils.hashing import safe_hash
 
 logger = init_logger(__name__)
 
-ProfilerKind = Literal["torch", "cuda"]
+ProfilerKind = Literal["torch", "cuda", "pcie"]
 
 
 def _is_uri_path(path: str) -> bool:
@@ -38,7 +38,8 @@ class ProfilerConfig:
     """Which profiler to use. Defaults to None. Options are:
 
     - 'torch': Use PyTorch profiler.\n
-    - 'cuda': Use CUDA profiler."""
+    - 'cuda': Use CUDA profiler.\n
+    - 'pcie': Use lightweight PCIeTracer only (no torch profiler overhead)."""
 
     torch_profiler_dir: str = ""
     """Directory to save torch profiler traces. Both AsyncLLM's CPU traces and
@@ -109,12 +110,15 @@ class ProfilerConfig:
             )
 
         profiler_dir = self.torch_profiler_dir
-        if profiler_dir and self.profiler != "torch":
+        if profiler_dir and self.profiler not in ("torch", "pcie"):
             raise ValueError(
-                "torch_profiler_dir is only applicable when profiler is set to 'torch'"
+                "torch_profiler_dir is only applicable when profiler is set to "
+                "'torch' or 'pcie'"
             )
-        if self.profiler == "torch" and not profiler_dir:
-            raise ValueError("torch_profiler_dir must be set when profiler is 'torch'")
+        if self.profiler in ("torch", "pcie") and not profiler_dir:
+            raise ValueError(
+                "torch_profiler_dir must be set when profiler is 'torch' or 'pcie'"
+            )
 
         # Support any URI scheme (gs://, s3://, hdfs://, etc.)
         # These paths should not be converted to absolute paths

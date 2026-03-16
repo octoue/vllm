@@ -39,7 +39,11 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
-from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
+from vllm.profiler.wrapper import (
+    CudaProfilerWrapper,
+    PCIeOnlyProfilerWrapper,
+    TorchProfilerWrapper,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
@@ -114,6 +118,11 @@ class Worker(WorkerBase):
             )
         elif profiler_config.profiler == "cuda":
             self.profiler = CudaProfilerWrapper(profiler_config)
+        elif profiler_config.profiler == "pcie":
+            self.profiler = PCIeOnlyProfilerWrapper(
+                profiler_config,
+                local_rank=self.local_rank,
+            )
         else:
             self.profiler = None
 

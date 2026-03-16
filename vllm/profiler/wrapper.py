@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -273,3 +274,50 @@ class CudaProfilerWrapper(WorkerProfiler):
     @override
     def annotate_context_manager(self, name: str):
         return torch.cuda.nvtx.range(name)
+
+
+class PCIeOnlyProfilerWrapper(WorkerProfiler):
+    """Lightweight profiler that only manages PCIeTracer lifecycle.
+
+    No torch.profiler overhead - stop_profile completes in <1s instead of 20+ min.
+    Requires VLLM_PCIE_TRACE=1 for PCIeTracer to record events.
+    """
+
+    def __init__(
+        self,
+        profiler_config: ProfilerConfig,
+        local_rank: int,
+    ) -> None:
+        super().__init__(profiler_config)
+        self.local_rank = local_rank
+        self.output_dir = profiler_config.torch_profiler_dir
+        if local_rank in (None, 0):
+            logger.info_once(
+                "PCIe-only profiling enabled. Events will be saved to: %s",
+                self.output_dir,
+                scope="local",
+            )
+
+    @override
+    def _start(self) -> None:
+        tracer = get_pcie_tracer()
+        if tracer is not None:
+            tracer.clear()
+
+    @override
+    def _stop(self) -> None:
+        tracer = get_pcie_tracer()
+        if (
+            tracer is not None
+            and self.output_dir
+            and not _is_uri_path(self.output_dir)
+        ):
+            os.makedirs(self.output_dir, exist_ok=True)
+            pcie_path = f"{self.output_dir}/pcie_events_{self.local_rank}.json"
+            try:
+                tracer.save_json(pcie_path)
+                logger.info_once(
+                    "PCIe events saved to %s", pcie_path, scope="local"
+                )
+            except Exception as e:
+                logger.warning("Failed to save PCIe events: %s", e)
