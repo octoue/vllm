@@ -844,11 +844,25 @@ class GroupCoordinator:
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
 
-        total_gpu_bytes = sum(
-            t.numel() * t.element_size()
-            for t in tensor_list
-            if t.is_cuda and t.numel() > 0
-        )
+        # logical_bytes = full tensor sizes; wire_bytes = actual P2P transfer size
+        logical_bytes = 0
+        wire_bytes = 0
+        for key, tensor in zip(tensor_keys, tensor_list):
+            if not tensor.is_cuda or tensor.numel() == 0:
+                continue
+            elem_bytes = tensor.numel() * tensor.element_size()
+            logical_bytes += elem_bytes
+            use_ag = (
+                all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+            )
+            use_ag = (
+                all_gather_tensors.get(key, use_ag)
+                if all_gather_tensors
+                else use_ag
+            )
+            wire_bytes += elem_bytes // all_gather_size if use_ag else elem_bytes
+
         with torch.profiler.record_function(
             f"PP_Send_rank{self.rank_in_group}_to_{dst}"
         ):
@@ -858,7 +872,6 @@ class GroupCoordinator:
             start_event.record()
             for key, tensor in zip(tensor_keys, tensor_list):
                 if tensor.numel() == 0:
-                    # Skip sending empty tensors.
                     continue
 
                 # send-allgather: send only a slice, then do allgather.
@@ -875,12 +888,10 @@ class GroupCoordinator:
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
                 if tensor.is_cpu:
-                    # use metadata_group for CPU tensors
                     torch.distributed.send(
                         tensor, dst=self.ranks[dst], group=metadata_group
                     )
                 else:
-                    # use group for GPU tensors
                     torch.distributed.send(
                         tensor, dst=self.ranks[dst], group=group
                     )
@@ -889,17 +900,27 @@ class GroupCoordinator:
             torch.cuda.nvtx.range_pop()
 
             tracer = get_pcie_tracer()
-            if tracer is not None and total_gpu_bytes > 0:
+            if tracer is not None and wire_bytes > 0:
                 elapsed_ms = start_event.elapsed_time(end_event)
                 end_us = time.perf_counter() * 1e6
                 start_us = end_us - elapsed_ms * 1000
+                transport_scope = (
+                    "intra_node" if (_NODE_COUNT is not None and _NODE_COUNT == 1)
+                    else None
+                )
                 tracer.record_event(
-                    op_type="PP_Transfer",
+                    op_type="PP_P2P_Send",
                     gpu_id=torch.cuda.current_device(),
                     direction="P2P",
                     start_us=start_us,
                     end_us=end_us,
-                    size_bytes=total_gpu_bytes,
+                    size_bytes=wire_bytes,
+                    wire_bytes=wire_bytes,
+                    logical_bytes=logical_bytes,
+                    src_rank=self.rank_in_group,
+                    dst_rank=dst,
+                    group="pp",
+                    transport_scope=transport_scope,
                 )
         return None
 
@@ -950,20 +971,40 @@ class GroupCoordinator:
             )
 
         recv_metadata_list = self.recv_object(src=src)
-        total_gpu_bytes = sum(
-            math.prod(value.size) * torch.empty(1, dtype=value.dtype).element_size()
-            for key, value in recv_metadata_list
-            if isinstance(value, TensorMetadata)
-            and value.device == "cuda"
-            and math.prod(value.size) > 0
-        )
+
+        # Compute logical_bytes and wire_bytes for P2P recv
+        logical_bytes = 0
+        wire_bytes = 0
+        for key, value in recv_metadata_list:
+            if not isinstance(value, TensorMetadata) or value.device != "cuda":
+                continue
+            numel = math.prod(value.size)
+            if numel == 0:
+                continue
+            elem_size = torch.empty(1, dtype=value.dtype).element_size()
+            logical_bytes += numel * elem_size
+            use_ag = (
+                all_gather_group is not None and numel % all_gather_size == 0
+            )
+            use_ag = (
+                all_gather_tensors.get(key, use_ag)
+                if all_gather_tensors
+                else use_ag
+            )
+            wire_bytes += (numel * elem_size) // all_gather_size if use_ag else (
+                numel * elem_size
+            )
+
         with torch.profiler.record_function(
             f"PP_Recv_rank{self.rank_in_group}_from_{src}"
         ):
             torch.cuda.nvtx.range_push(f"PP_Recv_rank{self.rank_in_group}")
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
+
+            # Phase 1: P2P recv only
+            start_recv = torch.cuda.Event(enable_timing=True)
+            end_recv = torch.cuda.Event(enable_timing=True)
+            start_recv.record()
+            recv_slices: list[tuple[str, torch.Tensor, tuple[int, ...], bool]] = []
             tensor_dict: dict[str, Any] = {}
             for key, value in recv_metadata_list:
                 if isinstance(value, TensorMetadata):
@@ -971,11 +1012,9 @@ class GroupCoordinator:
                         value.size, dtype=value.dtype, device=value.device
                     )
                     if tensor.numel() == 0:
-                        # Skip broadcasting empty tensors.
                         tensor_dict[key] = tensor
                         continue
 
-                    # send-allgather: send only a slice, then do allgather.
                     use_all_gather = (
                         all_gather_group is not None
                         and tensor.numel() % all_gather_size == 0
@@ -988,49 +1027,89 @@ class GroupCoordinator:
 
                     if use_all_gather:
                         orig_shape = tensor.shape
-                        tensor = tensor.reshape(all_gather_size, -1)[
+                        recv_tensor = tensor.reshape(all_gather_size, -1)[
                             all_gather_rank
                         ]
+                        recv_slices.append((key, recv_tensor, orig_shape, True))
+                    else:
+                        recv_tensor = tensor
+                        recv_slices.append((key, recv_tensor, (), False))
 
-                    if tensor.is_cpu:
-                        # use metadata_group for CPU tensors
+                    if recv_tensor.is_cpu:
                         torch.distributed.recv(
-                            tensor,
+                            recv_tensor,
                             src=self.ranks[src],
                             group=metadata_group,
                         )
                     else:
-                        # use group for GPU tensors
                         torch.distributed.recv(
-                            tensor, src=self.ranks[src], group=group
+                            recv_tensor, src=self.ranks[src], group=group
                         )
-                    if use_all_gather:
-                        # do the allgather
-                        tensor = all_gather_group.all_gather(  # type: ignore
-                            tensor, dim=0
-                        )
-                        tensor = tensor.reshape(orig_shape)
-
-                    tensor_dict[key] = tensor
+                    if not use_all_gather:
+                        tensor_dict[key] = recv_tensor
                 else:
                     tensor_dict[key] = value
-            end_event.record()
+            end_recv.record()
             torch.cuda.current_stream().synchronize()
-            torch.cuda.nvtx.range_pop()
 
             tracer = get_pcie_tracer()
-            if tracer is not None and total_gpu_bytes > 0:
-                elapsed_ms = start_event.elapsed_time(end_event)
+            if tracer is not None and wire_bytes > 0:
+                elapsed_ms = start_recv.elapsed_time(end_recv)
                 end_us = time.perf_counter() * 1e6
                 start_us = end_us - elapsed_ms * 1000
+                transport_scope = (
+                    "intra_node"
+                    if (_NODE_COUNT is not None and _NODE_COUNT == 1)
+                    else None
+                )
                 tracer.record_event(
-                    op_type="PP_Transfer",
+                    op_type="PP_P2P_Recv",
                     gpu_id=torch.cuda.current_device(),
                     direction="P2P",
                     start_us=start_us,
                     end_us=end_us,
-                    size_bytes=total_gpu_bytes,
+                    size_bytes=wire_bytes,
+                    wire_bytes=wire_bytes,
+                    logical_bytes=logical_bytes,
+                    src_rank=src,
+                    dst_rank=self.rank_in_group,
+                    group="pp",
+                    transport_scope=transport_scope,
                 )
+
+            # Phase 2: TP all_gather reconstruct (GPU-only, for send-allgather)
+            if recv_slices and all_gather_group is not None:
+                start_ag = torch.cuda.Event(enable_timing=True)
+                end_ag = torch.cuda.Event(enable_timing=True)
+                start_ag.record()
+                ag_bytes = 0
+                for key, recv_tensor, orig_shape, need_ag in recv_slices:
+                    if need_ag and recv_tensor.is_cuda:
+                        tensor = all_gather_group.all_gather(  # type: ignore
+                            recv_tensor, dim=0
+                        )
+                        tensor = tensor.reshape(orig_shape)
+                        tensor_dict[key] = tensor
+                        ag_bytes += tensor.numel() * tensor.element_size()
+                end_ag.record()
+                torch.cuda.current_stream().synchronize()
+                if tracer is not None and ag_bytes > 0:
+                    elapsed_ag = start_ag.elapsed_time(end_ag)
+                    end_us_ag = time.perf_counter() * 1e6
+                    start_us_ag = end_us_ag - elapsed_ag * 1000
+                    tracer.record_event(
+                        op_type="PP_TP_AllGather_Reconstruct",
+                        gpu_id=torch.cuda.current_device(),
+                        direction="P2P",
+                        start_us=start_us_ag,
+                        end_us=end_us_ag,
+                        size_bytes=ag_bytes,
+                        wire_bytes=ag_bytes,
+                        logical_bytes=ag_bytes,
+                        group="pp",
+                    )
+
+            torch.cuda.nvtx.range_pop()
         return tensor_dict
 
     def barrier(self):

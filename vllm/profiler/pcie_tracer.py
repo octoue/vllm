@@ -23,24 +23,37 @@ if TYPE_CHECKING:
 
 @dataclass
 class PCIeEvent:
-    """A single PCIe transfer event."""
+    """A single PCIe transfer event.
 
-    op_type: str  # "Evict" | "Restore" | "Prefetch" | "PP_Transfer"
+    op_type: "Evict" | "Restore" | "Prefetch" | "PP_P2P_Send" | "PP_P2P_Recv"
+             | "PP_TP_AllGather_Reconstruct" | "PP_Transfer" (legacy aggregate)
+    wire_bytes: actual bytes on the link (for bandwidth); defaults to size_bytes
+    logical_bytes: logical tensor size (e.g. full tensor before send-allgather slice)
+    """
+
+    op_type: str
     gpu_id: int
     direction: str  # "H2D" | "D2H" | "P2P"
     start_us: float
     end_us: float
-    size_bytes: int
+    size_bytes: int  # kept for backward compat; equals wire_bytes when not split
+    wire_bytes: int | None = None
+    logical_bytes: int | None = None
+    src_rank: int | None = None
+    dst_rank: int | None = None
+    group: str | None = None
+    transport_scope: str | None = None  # "intra_node" | "inter_node"
 
     def to_dict(self) -> dict:
         duration_ms = (self.end_us - self.start_us) / 1000.0
-        size_mb = self.size_bytes / (1024 * 1024)
+        wire = self.wire_bytes if self.wire_bytes is not None else self.size_bytes
+        size_mb = wire / (1024 * 1024)
         bandwidth_gbps = (
-            (self.size_bytes / (1024**3)) / (duration_ms / 1000.0)
+            (wire / (1024**3)) / (duration_ms / 1000.0)
             if duration_ms > 0
             else 0.0
         )
-        return {
+        out: dict = {
             "op_type": self.op_type,
             "gpu_id": self.gpu_id,
             "direction": self.direction,
@@ -52,6 +65,19 @@ class PCIeEvent:
             "size_mb": size_mb,
             "bandwidth_gbps": bandwidth_gbps,
         }
+        if self.wire_bytes is not None:
+            out["wire_bytes"] = self.wire_bytes
+        if self.logical_bytes is not None:
+            out["logical_bytes"] = self.logical_bytes
+        if self.src_rank is not None:
+            out["src_rank"] = self.src_rank
+        if self.dst_rank is not None:
+            out["dst_rank"] = self.dst_rank
+        if self.group is not None:
+            out["group"] = self.group
+        if self.transport_scope is not None:
+            out["transport_scope"] = self.transport_scope
+        return out
 
 
 class PCIeTracer:
@@ -84,6 +110,13 @@ class PCIeTracer:
         start_us: float,
         end_us: float,
         size_bytes: int,
+        *,
+        wire_bytes: int | None = None,
+        logical_bytes: int | None = None,
+        src_rank: int | None = None,
+        dst_rank: int | None = None,
+        group: str | None = None,
+        transport_scope: str | None = None,
     ) -> None:
         with self._events_lock:
             self._events.append(
@@ -94,6 +127,12 @@ class PCIeTracer:
                     start_us=start_us,
                     end_us=end_us,
                     size_bytes=size_bytes,
+                    wire_bytes=wire_bytes,
+                    logical_bytes=logical_bytes,
+                    src_rank=src_rank,
+                    dst_rank=dst_rank,
+                    group=group,
+                    transport_scope=transport_scope,
                 )
             )
 

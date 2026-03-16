@@ -21,11 +21,14 @@ from pathlib import Path
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Color map: Offload-Evict (D2H), Offload-Restore (H2D), PP-Transfer, Prefetch
+# Color map: Offload-Evict (D2H), Offload-Restore (H2D), PP, Prefetch
 COLOR_MAP = {
     "Evict": "#E74C3C",
     "Restore": "#E67E22",
     "PP_Transfer": "#3498DB",
+    "PP_P2P_Send": "#3498DB",
+    "PP_P2P_Recv": "#2980B9",
+    "PP_TP_AllGather_Reconstruct": "#5DADE2",
     "Prefetch": "#2ECC71",
 }
 
@@ -43,7 +46,7 @@ def load_events(json_path: str) -> list[dict]:
 
 
 def compute_stats(events: list[dict]) -> dict:
-    """Compute per-op_type statistics."""
+    """Compute per-op_type statistics. Prefer wire_bytes when present."""
     stats = {}
     for e in events:
         op = e["op_type"]
@@ -55,7 +58,7 @@ def compute_stats(events: list[dict]) -> dict:
                 "bandwidths": [],
             }
         stats[op]["count"] += 1
-        stats[op]["total_bytes"] += e["size_bytes"]
+        stats[op]["total_bytes"] += e.get("wire_bytes", e["size_bytes"])
         stats[op]["total_duration_ms"] += e["duration_ms"]
         stats[op]["bandwidths"].append(e["bandwidth_gbps"])
 
@@ -207,7 +210,7 @@ def build_gantt(events: list[dict], output_path: str) -> None:
                 legendgroup=op_type,
                 hovertemplate=(
                     "<b>Type</b>: " + op_type + "<br>"
-                    "<b>Size</b>: %{customdata[0]:.2f} MB<br>"
+                    "<b>Size</b>: %{customdata[0]:.2f} MB (wire)<br>"
                     "<b>Duration</b>: %{x:.3f} ms<br>"
                     "<b>Bandwidth</b>: %{customdata[1]:.2f} GB/s"
                     "<extra></extra>"
