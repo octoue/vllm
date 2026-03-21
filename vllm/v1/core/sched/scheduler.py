@@ -846,6 +846,9 @@ class Scheduler(SchedulerInterface):
                     )
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    # Include in num_scheduled_tokens (0 compute tokens) to signal
+                    # that the request was scheduled for KV load.
+                    num_scheduled_tokens[request_id] = 0
                     continue
 
                 self.running.append(request)
