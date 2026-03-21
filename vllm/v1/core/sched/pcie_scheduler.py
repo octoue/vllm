@@ -12,7 +12,6 @@ import heapq
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
-from queue import PriorityQueue
 from typing import TYPE_CHECKING, Any, Callable
 
 from vllm.logger import init_logger
@@ -153,10 +152,14 @@ class PCIeTransferScheduler:
         if self._dispatch_fn is None:
             return True
 
-        return self._flush_pending_transfers()
+        # Only queue; caller must call flush() to dispatch in priority order.
+        return False
 
     def _flush_pending_transfers(self) -> bool:
         """Dispatch pending transfers up to the concurrency limit.
+
+        Evict (D2H) is not limited by max_concurrent_h2d and can run alongside
+        H2D transfers. H2D (Prefetch/Restore) respect the limit.
 
         Returns:
             True if at least one transfer was dispatched.
@@ -164,9 +167,19 @@ class PCIeTransferScheduler:
         if self._dispatch_fn is None:
             return False
         dispatched = False
-        while self._pending_transfers and self._active_h2d_count < self.max_concurrent_h2d:
+        max_iter = len(self._pending_transfers) + 1  # prevent infinite loop
+        for _ in range(max_iter):
+            if not self._pending_transfers:
+                break
             _, _, req = heapq.heappop(self._pending_transfers)
             is_h2d = req.label in ("Prefetch", "Restore")
+            if is_h2d and self._active_h2d_count >= self.max_concurrent_h2d:
+                # At H2D limit; skip this one and try next (may be Evict).
+                heapq.heappush(
+                    self._pending_transfers,
+                    (req.priority, req._sequence, req),
+                )
+                continue
             if is_h2d:
                 self._active_h2d_count += 1
             success = self._dispatch_fn(req)
@@ -199,9 +212,14 @@ class PCIeTransferScheduler:
             self._active_h2d_count -= 1
 
     def on_pp_phase_change(self, new_phase: PPPhase) -> None:
-        """Handle PP phase change. In IDLE phase, flush pending H2D transfers."""
+        """Handle PP phase change. In RECV phase, reset H2D count (new scheduling
+        window). In IDLE phase, flush pending H2D transfers."""
         self._pp_phase = new_phase
-        if new_phase == PPPhase.IDLE:
+        if new_phase == PPPhase.RECV:
+            # RECV marks the start of a new scheduling window; release H2D slots
+            # so the next IDLE flush can dispatch pending transfers.
+            self._active_h2d_count = 0
+        elif new_phase == PPPhase.IDLE:
             self._flush_pending_transfers()
 
     @property
