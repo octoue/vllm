@@ -272,6 +272,13 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def notify_pp_recv_done(self) -> None:
+        """
+        Notify that PP_Recv has completed. Used by PCIe scheduler to align
+        H2D transfers with pipeline idle windows. Default: no-op.
+        """
+        return
+
     @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """

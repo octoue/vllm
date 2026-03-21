@@ -34,6 +34,12 @@ from vllm.v1.kv_offload.abstract import OffloadingManager
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
 from vllm.v1.kv_offload.spec import OffloadingSpec
+from vllm.v1.core.sched.pcie_scheduler import (
+    PCIeTransferScheduler,
+    TransferPriority,
+    TransferRequest,
+    PPPhase,
+)
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingWorker,
     TransferSpec,
@@ -149,6 +155,13 @@ class OffloadingConnector(KVConnectorBase_V1):
     def handle_preemptions(self, preempted_req_ids: set[str]):
         assert self.connector_worker is not None
         self.connector_worker.handle_preemptions(preempted_req_ids)
+
+    def notify_pp_recv_done(self) -> None:
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.on_pp_phase_change(PPPhase.IDLE)
+            pcie.flush()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -604,10 +617,43 @@ class OffloadingConnectorWorker:
 
         self._finished_reqs_waiting_for_store: set[ReqId] = set()
 
+        # PCIe transfer scheduler for PP-phase-aware orchestration
+        sc = spec.vllm_config.scheduler_config
+        self._pcie_scheduler: PCIeTransferScheduler | None = None
+        if sc.enable_pcie_scheduling:
+            self._pcie_scheduler = PCIeTransferScheduler(
+                max_concurrent_h2d=sc.max_concurrent_h2d,
+                prefetch_block_threshold=sc.prefetch_block_threshold,
+                enable_pp_phase_aware=sc.enable_pp_phase_aware,
+                evict_batch_size=sc.evict_batch_size,
+                dispatch_fn=self._dispatch_pcie_transfer,
+            )
+
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
         self._job_counter = job_id + 1
         return job_id
+
+    def _dispatch_pcie_transfer(self, req: TransferRequest) -> bool:
+        """Dispatch a transfer to the worker. Used by PCIeTransferScheduler."""
+        if req.label == "Evict":
+            job_id = req.extra.get("job_id")
+            if job_id is None:
+                return False
+            return self.worker.transfer_async(
+                job_id, req.transfer_spec, label=req.label
+            )
+        else:
+            # Restore or Prefetch
+            req_id = req.req_id
+            if req_id is None:
+                return False
+            job_id = self._generate_job_id()
+            self._jobs[job_id] = (req_id, False)
+            self._load_job[req_id] = job_id
+            return self.worker.transfer_async(
+                job_id, req.transfer_spec, label=req.label
+            )
 
     def _register_handlers(
         self,
@@ -652,23 +698,59 @@ class OffloadingConnectorWorker:
                 self.worker.wait(job_ids)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(
-                job_id, transfer_spec, label="Evict"
-            )
-            assert success
-        self._unsubmitted_store_jobs.clear()
+        if self._pcie_scheduler is not None:
+            # PCIe scheduling: submit to priority queue
+            for job_id, transfer_spec in self._unsubmitted_store_jobs:
+                self._pcie_scheduler.submit_transfer(
+                    transfer_spec,
+                    priority=TransferPriority.EVICT,
+                    label="Evict",
+                    req_id=None,
+                    extra={"job_id": job_id},
+                )
+            self._unsubmitted_store_jobs.clear()
 
-        for req_id, transfer_spec in metadata.reqs_to_load.items():
-            job_id = self._generate_job_id()
-            self._jobs[job_id] = (req_id, False)
-            assert req_id not in self._load_job
-            self._load_job[req_id] = job_id
-            label = "Prefetch" if req_id in metadata.prefetch_req_ids else "Restore"
-            success = self.worker.transfer_async(
-                job_id, transfer_spec, label=label
-            )
-            assert success
+            for req_id, transfer_spec in metadata.reqs_to_load.items():
+                label = (
+                    "Prefetch"
+                    if req_id in metadata.prefetch_req_ids
+                    else "Restore"
+                )
+                priority = (
+                    TransferPriority.PREFETCH
+                    if label == "Prefetch"
+                    else TransferPriority.RESTORE
+                )
+                self._pcie_scheduler.submit_transfer(
+                    transfer_spec,
+                    priority=priority,
+                    label=label,
+                    req_id=req_id,
+                )
+            self._pcie_scheduler.flush()
+        else:
+            # Original path: direct submission
+            for job_id, transfer_spec in self._unsubmitted_store_jobs:
+                success = self.worker.transfer_async(
+                    job_id, transfer_spec, label="Evict"
+                )
+                assert success
+            self._unsubmitted_store_jobs.clear()
+
+            for req_id, transfer_spec in metadata.reqs_to_load.items():
+                job_id = self._generate_job_id()
+                self._jobs[job_id] = (req_id, False)
+                assert req_id not in self._load_job
+                self._load_job[req_id] = job_id
+                label = (
+                    "Prefetch"
+                    if req_id in metadata.prefetch_req_ids
+                    else "Restore"
+                )
+                success = self.worker.transfer_async(
+                    job_id, transfer_spec, label=label
+                )
+                assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for req_id, transfer_spec in metadata.reqs_to_store.items():
@@ -697,6 +779,10 @@ class OffloadingConnectorWorker:
             job_id = transfer_result.job_id
             assert transfer_result.success
             req_id, store = self._jobs.pop(job_id)
+            if self._pcie_scheduler is not None and not store:
+                # H2D (Restore/Prefetch) completed - notify and flush pending
+                self._pcie_scheduler.on_transfer_completed("Restore")
+                self._pcie_scheduler.flush()
             if (
                 transfer_result.transfer_time
                 and transfer_result.transfer_size is not None

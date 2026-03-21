@@ -96,12 +96,19 @@ class CPUOffloadingSpec(OffloadingSpec):
                     "CPU Offloading is currently only supported on CUDA-alike GPUs"
                 )
 
+            sc = self.vllm_config.scheduler_config
+            max_concurrent_h2d = (
+                sc.max_concurrent_h2d
+                if sc.enable_pcie_scheduling
+                else 0
+            )
             self._handlers = CpuGpuOffloadingHandlers(
                 attn_backends=attn_backends,
                 gpu_block_size=self.gpu_block_size,
                 cpu_block_size=self.offloaded_block_size,
                 num_cpu_blocks=self.num_blocks,
                 gpu_caches=kv_caches,
+                max_concurrent_h2d=max_concurrent_h2d,
             )
 
         assert self._handlers is not None

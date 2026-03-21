@@ -1100,6 +1100,9 @@ class VllmConfig:
             # Default to enable HMA if not explicitly disabled by user or logic above.
             self.scheduler_config.disable_hybrid_kv_cache_manager = False
 
+        if envs.VLLM_PCIE_SCHEDULER:
+            self.scheduler_config.enable_pcie_scheduling = True
+
         if self.cache_config.mamba_cache_mode == "align":
             if self.scheduler_config.long_prefill_token_threshold > 0:
                 assert (

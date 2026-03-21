@@ -657,6 +657,8 @@ class Worker(WorkerBase):
                 )
             assert tensor_dict is not None
             intermediate_tensors = IntermediateTensors(tensor_dict)
+            if has_kv_transfer_group():
+                get_kv_transfer_group().notify_pp_recv_done()
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(

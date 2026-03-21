@@ -57,6 +57,8 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    enable_pcie_scheduling: bool = False,
+    prefetch_block_threshold: int = 50,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -89,6 +91,8 @@ def create_scheduler(
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
+        enable_pcie_scheduling=enable_pcie_scheduling,
+        prefetch_block_threshold=prefetch_block_threshold,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(

@@ -668,6 +668,21 @@ class Scheduler(SchedulerInterface):
                 # Prefetch: never do GPU compute. Finish or discard in scheduler.
                 if request.prefetch_only:
                     if num_external_computed_tokens > 0 and load_kv_async:
+                        # PCIe scheduling: defer prefetch when GPU blocks are tight.
+                        if self.scheduler_config.enable_pcie_scheduling:
+                            free_blocks = (
+                                self.kv_cache_manager.get_num_free_blocks()
+                            )
+                            if free_blocks < self.scheduler_config.prefetch_block_threshold:
+                                logger.debug(
+                                    "Prefetch %s: deferred (free_blocks=%d < %d)",
+                                    request_id,
+                                    free_blocks,
+                                    self.scheduler_config.prefetch_block_threshold,
+                                )
+                                self.waiting.pop_request()
+                                skipped_waiting_requests.prepend_request(request)
+                                continue
                         # CPU offload hit: let it proceed to allocate + load.
                         logger.info(
                             "Prefetch %s: CPU hit, loading %d tokens from offload",

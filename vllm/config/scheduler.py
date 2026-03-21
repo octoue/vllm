@@ -139,6 +139,24 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    # PCIe transfer scheduling (KV offloading + PP + Prefetch coordination)
+    enable_pcie_scheduling: bool = False
+    """Enable PCIe-aware transfer scheduling to reduce bandwidth contention
+    between KV offloading, pipeline parallelism, and KV prefetch.
+    Can be enabled via VLLM_PCIE_SCHEDULER=1 environment variable."""
+
+    max_concurrent_h2d: int = Field(default=2, ge=1)
+    """Maximum concurrent H2D (Prefetch/Restore) transfers when PCIe scheduling enabled."""
+
+    prefetch_block_threshold: int = Field(default=50, ge=0)
+    """Defer prefetch when free_blocks < this value (PCIe scheduling only)."""
+
+    enable_pp_phase_aware: bool = True
+    """Align H2D transfers with PP pipeline idle windows (PCIe scheduling only)."""
+
+    evict_batch_size: int = Field(default=4, ge=1)
+    """Reserved for Evict batch aggregation (PCIe scheduling only)."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

@@ -80,6 +80,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         dst_tensors: list[torch.Tensor],
         src_block_size_factor: int,
         dst_block_size_factor: int,
+        max_concurrent_streams: int = 0,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -118,10 +119,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self._stream_pool: list[torch.cuda.Stream] = []
         # list of CUDA events available for re-use
         self._event_pool: list[torch.Event] = []
+        # 0 = no limit
+        self._max_concurrent_streams = max_concurrent_streams
 
     def transfer_async(
         self, job_id: int, transfer_spec: TransferSpec, label: str = "Offload"
     ) -> bool:
+        if (
+            self._max_concurrent_streams > 0
+            and len(self._transfers) >= self._max_concurrent_streams
+        ):
+            return False
         src_spec, dst_spec = transfer_spec
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
@@ -258,6 +266,7 @@ class CpuGpuOffloadingHandlers:
         num_cpu_blocks: int,
         gpu_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
+        max_concurrent_h2d: int = 0,
     ):
         assert gpu_caches
         assert cpu_block_size % gpu_block_size == 0
@@ -347,4 +356,5 @@ class CpuGpuOffloadingHandlers:
             dst_tensors=gpu_tensors,
             src_block_size_factor=cpu_block_size_factor,
             dst_block_size_factor=gpu_block_size_factor,
+            max_concurrent_streams=max_concurrent_h2d,
         )

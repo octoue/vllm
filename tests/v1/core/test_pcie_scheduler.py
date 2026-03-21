@@ -1,0 +1,322 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Unit tests for the PCIe transfer scheduler and its integration."""
+
+import pytest
+
+from vllm.v1.core.sched.pcie_scheduler import (
+    PCIeTransferScheduler,
+    PPPhase,
+    TransferPriority,
+    TransferRequest,
+)
+from vllm.v1.outputs import ModelRunnerOutput
+
+from .utils import create_requests, create_scheduler, mock_kv
+
+pytestmark = pytest.mark.cpu_test
+
+
+# ------------------------------------------------------------------
+# PCIeTransferScheduler core logic
+# ------------------------------------------------------------------
+
+
+def test_priority_order():
+    """Transfers are dispatched in priority order: RESTORE > PREFETCH > EVICT."""
+    dispatched = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.flush()
+
+    assert dispatched == ["Restore", "Prefetch", "Evict"]
+
+
+def test_same_priority_fifo():
+    """Same-priority requests are dispatched in FIFO order."""
+    dispatched = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.req_id or req._sequence)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="a")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="b")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="c")
+    sched.flush()
+
+    assert [r for r in dispatched if isinstance(r, str)] == ["a", "b", "c"]
+
+
+def test_concurrency_limit():
+    """max_concurrent_h2d limits active H2D transfers; third stays pending."""
+    dispatched = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=2,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch")
+    sched.flush()
+
+    assert len(dispatched) == 2
+    assert sched.has_pending_transfers is True
+    assert sched._active_h2d_count == 2
+
+    sched.on_transfer_completed("Restore")
+    sched.flush()
+    assert len(dispatched) == 3
+    assert sched.has_pending_transfers is False
+
+
+def test_evict_not_limited_by_h2d():
+    """Evict is not limited by max_concurrent_h2d."""
+    dispatched = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=2,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
+    sched.flush()
+
+    assert "Evict" in dispatched
+    assert dispatched == ["Restore", "Restore", "Evict"]
+
+
+def test_should_defer_prefetch():
+    """should_defer_prefetch returns True when free_blocks < threshold."""
+    sched = PCIeTransferScheduler(prefetch_block_threshold=50)
+    assert sched.should_defer_prefetch(49) is True
+    assert sched.should_defer_prefetch(50) is False
+    assert sched.should_defer_prefetch(51) is False
+
+
+def test_pp_phase_idle_triggers_flush():
+    """on_pp_phase_change(IDLE) triggers flush of pending transfers."""
+    dispatched = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=1,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.flush()
+    assert len(dispatched) == 1
+
+    sched.on_pp_phase_change(PPPhase.RECV)
+    assert len(dispatched) == 1
+
+    sched.on_pp_phase_change(PPPhase.IDLE)
+    assert len(dispatched) == 2
+
+
+def test_pp_phase_recv_no_flush():
+    """on_pp_phase_change(RECV) does not flush."""
+    dispatched = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=1,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.flush()
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    assert len(dispatched) == 1
+
+    sched.on_pp_phase_change(PPPhase.RECV)
+    assert len(dispatched) == 1
+    assert sched.has_pending_transfers is True
+
+
+def test_dispatch_fn_false_requeues():
+    """When dispatch_fn returns False, request is requeued."""
+    call_count = 0
+
+    def fail_twice_then_ok(req: TransferRequest) -> bool:
+        nonlocal call_count
+        call_count += 1
+        return call_count >= 3
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=2,
+        dispatch_fn=fail_twice_then_ok,
+    )
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    result = sched.flush()
+    assert result is False
+    assert call_count == 1
+
+    sched.flush()
+    assert call_count == 2
+    assert sched.has_pending_transfers is True
+
+    sched.flush()
+    assert call_count == 3
+    assert sched.has_pending_transfers is False
+
+
+# ------------------------------------------------------------------
+# Scheduler integration: prefetch deferral
+# ------------------------------------------------------------------
+
+
+def test_prefetch_deferred_when_blocks_tight():
+    """Prefetch is deferred when free_blocks < prefetch_block_threshold."""
+    num_blocks = 30
+    prefetch_threshold = 25
+    # 4 requests * 2 blocks each (32 tokens) = 8 blocks used, free=22 < 25
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=32, is_async=True),
+        enable_pcie_scheduling=True,
+        prefetch_block_threshold=prefetch_threshold,
+        num_blocks=num_blocks,
+    )
+    requests = create_requests(
+        num_requests=5, num_tokens=32, max_tokens=16, same_prompt=True
+    )
+    requests[4].prefetch_only = True
+
+    for i in range(4):
+        scheduler.add_request(requests[i])
+
+    sched_out = scheduler.schedule()
+    model_out = ModelRunnerOutput(
+        req_ids=list(sched_out.num_scheduled_tokens.keys()),
+        req_id_to_index={
+            r: i for i, r in enumerate(sched_out.num_scheduled_tokens)
+        },
+        sampled_token_ids=[[1], [1], [1], [1]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(sched_out, model_out)
+
+    free_before = scheduler.kv_cache_manager.get_num_free_blocks()
+    assert free_before < prefetch_threshold, (
+        f"Need free_blocks < {prefetch_threshold} for deferral, got {free_before}"
+    )
+
+    scheduler.add_request(requests[4])
+    sched_out2 = scheduler.schedule()
+
+    assert requests[4].request_id not in sched_out2.num_scheduled_tokens
+    assert requests[4].request_id in [r.request_id for r in scheduler.waiting]
+
+
+def test_prefetch_not_deferred_when_blocks_available():
+    """Prefetch proceeds when free_blocks >= prefetch_block_threshold."""
+    num_blocks = 100
+    prefetch_threshold = 25
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=32, is_async=True),
+        enable_pcie_scheduling=True,
+        prefetch_block_threshold=prefetch_threshold,
+        num_blocks=num_blocks,
+    )
+    requests = create_requests(
+        num_requests=1, num_tokens=32, max_tokens=16
+    )
+    requests[0].prefetch_only = True
+
+    scheduler.add_request(requests[0])
+    sched_out = scheduler.schedule()
+
+    assert scheduler.kv_cache_manager.get_num_free_blocks() >= prefetch_threshold
+    assert requests[0].request_id in sched_out.num_scheduled_tokens
+
+
+# ------------------------------------------------------------------
+# OffloadingConnectorWorker integration (mock-based)
+# ------------------------------------------------------------------
+
+
+def test_offloading_connector_creates_pcie_scheduler_when_enabled():
+    """When enable_pcie_scheduling, OffloadingConnectorWorker creates PCIeTransferScheduler."""
+    from unittest.mock import MagicMock
+
+    from vllm.config import SchedulerConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnectorWorker,
+    )
+    from vllm.v1.kv_offload.spec import OffloadingSpec
+
+    sc = SchedulerConfig(
+        max_num_seqs=8,
+        max_num_batched_tokens=1024,
+        max_model_len=1024,
+        is_encoder_decoder=False,
+        enable_pcie_scheduling=True,
+    )
+    spec = MagicMock(spec=OffloadingSpec)
+    spec.vllm_config.scheduler_config = sc
+    spec.vllm_config.kv_connector_config = None
+    spec.get_manager.return_value = MagicMock()
+
+    conn = OffloadingConnectorWorker(spec=spec)
+    assert conn._pcie_scheduler is not None
+    assert isinstance(conn._pcie_scheduler, PCIeTransferScheduler)
+
+
+def test_offloading_connector_no_pcie_scheduler_when_disabled():
+    """When enable_pcie_scheduling=False, OffloadingConnectorWorker has no PCIe scheduler."""
+    from unittest.mock import MagicMock
+
+    from vllm.config import SchedulerConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnectorWorker,
+    )
+    from vllm.v1.kv_offload.spec import OffloadingSpec
+
+    sc = SchedulerConfig(
+        max_num_seqs=8,
+        max_num_batched_tokens=1024,
+        max_model_len=1024,
+        is_encoder_decoder=False,
+        enable_pcie_scheduling=False,
+    )
+    spec = MagicMock(spec=OffloadingSpec)
+    spec.vllm_config.scheduler_config = sc
+    spec.vllm_config.kv_connector_config = None
+    spec.get_manager.return_value = MagicMock()
+
+    conn = OffloadingConnectorWorker(spec=spec)
+    assert conn._pcie_scheduler is None
