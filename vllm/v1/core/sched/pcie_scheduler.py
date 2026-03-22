@@ -166,6 +166,9 @@ class PCIeTransferScheduler:
 
         # Update statistics
         self._stats["total_submitted"] += 1
+        if self._stats["total_submitted"] % 20 == 0:
+            logger.debug(f"PCIe Scheduler: {self._stats['total_submitted']} submitted, "
+                         f"queue={len(self._pending_transfers)}, phase={self._pp_phase.name}")
         current_depth = len(self._pending_transfers)
         if current_depth > self._stats["max_queue_depth"]:
             self._stats["max_queue_depth"] = current_depth
@@ -247,6 +250,9 @@ class PCIeTransferScheduler:
     def on_pp_phase_change(self, new_phase: PPPhase) -> None:
         """Handle PP phase change. In RECV phase, reset H2D count (new scheduling
         window). In IDLE phase, flush pending H2D transfers."""
+        if new_phase != self._pp_phase:
+            logger.debug(f"PP Phase: {self._pp_phase.name} → {new_phase.name}, "
+                         f"pending={len(self._pending_transfers)}")
         self._pp_phase = new_phase
 
         if new_phase == PPPhase.RECV:

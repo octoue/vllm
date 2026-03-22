@@ -157,6 +157,7 @@ class OffloadingConnector(KVConnectorBase_V1):
         self.connector_worker.handle_preemptions(preempted_req_ids)
 
     def notify_pp_recv_done(self) -> None:
+        logger.debug("notify_pp_recv_done called")
         if self.connector_worker is not None and (
             pcie := self.connector_worker._pcie_scheduler
         ) is not None:
@@ -168,18 +169,21 @@ class OffloadingConnector(KVConnectorBase_V1):
             # 对于其他rank，recv_done不做任何操作，等待send_done
 
     def notify_pp_recv_start(self) -> None:
+        logger.debug("notify_pp_recv_start called")
         if self.connector_worker is not None and (
             pcie := self.connector_worker._pcie_scheduler
         ) is not None:
             pcie.on_pp_phase_change(PPPhase.RECV)
 
     def notify_pp_send_start(self) -> None:
+        logger.debug("notify_pp_send_start called")
         if self.connector_worker is not None and (
             pcie := self.connector_worker._pcie_scheduler
         ) is not None:
             pcie.on_pp_phase_change(PPPhase.SEND)
 
     def notify_pp_send_done(self) -> None:
+        logger.debug("notify_pp_send_done called")
         if self.connector_worker is not None and (
             pcie := self.connector_worker._pcie_scheduler
         ) is not None:
@@ -751,6 +755,8 @@ class OffloadingConnectorWorker:
                     req_id=req_id,
                 )
             self._pcie_scheduler.flush()
+            if self._pcie_scheduler._stats["total_submitted"] == 1:
+                logger.info("PCIe Scheduler: first transfer submitted")
         else:
             # Original path: direct submission
             for job_id, transfer_spec in self._unsubmitted_store_jobs:
@@ -843,7 +849,11 @@ class OffloadingConnectorWorker:
         # Periodically log PCIe scheduler statistics
         if self._pcie_scheduler is not None:
             total_submitted = self._pcie_scheduler._stats["total_submitted"]
-            if total_submitted > 0 and total_submitted % 100 == 0:
+            if total_submitted > 0 and total_submitted % 50 == 0:
+                self._pcie_scheduler.log_stats()
+            # Force stats output near test end
+            if total_submitted > 200 and total_submitted < 260:
+                logger.info("=== PCIe Scheduler Near-End Stats ===")
                 self._pcie_scheduler.log_stats()
 
         return finished_sending, finished_recving
