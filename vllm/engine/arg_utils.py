@@ -583,6 +583,7 @@ class EngineArgs:
     enable_pcie_scheduling: bool = SchedulerConfig.enable_pcie_scheduling
     max_concurrent_h2d: int = SchedulerConfig.max_concurrent_h2d
     prefetch_block_threshold: int = SchedulerConfig.prefetch_block_threshold
+    enable_pp_phase_aware: bool = SchedulerConfig.enable_pp_phase_aware
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
@@ -1168,6 +1169,9 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--prefetch-block-threshold", **scheduler_kwargs["prefetch_block_threshold"]
         )
+        scheduler_group.add_argument(
+            "--enable-pp-phase-aware", **scheduler_kwargs["enable_pp_phase_aware"]
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -1693,6 +1697,7 @@ class EngineArgs:
             enable_pcie_scheduling=self.enable_pcie_scheduling,
             max_concurrent_h2d=self.max_concurrent_h2d,
             prefetch_block_threshold=self.prefetch_block_threshold,
+            enable_pp_phase_aware=self.enable_pp_phase_aware,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

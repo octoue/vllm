@@ -633,8 +633,10 @@ class OffloadingConnectorWorker:
         self._job_counter = 0
 
         self.kv_connector_stats = OffloadingConnectorStats()
-        # req_id -> (job_id, store)
+        # job_id -> (req_id, store)
         self._jobs: dict[int, tuple[ReqId, bool]] = {}
+        # job_id -> label for H2D loads (Restore/Prefetch), used by on_transfer_completed
+        self._load_job_label: dict[int, str] = {}
         # req_id -> active job IDs
         self._load_job: dict[ReqId, int] = {}
         # req_id -> set(active job IDs)
@@ -643,6 +645,7 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
 
         self._finished_reqs_waiting_for_store: set[ReqId] = set()
+        self._first_submit_logged: bool = False
 
         # PCIe transfer scheduler for PP-phase-aware orchestration
         sc = spec.vllm_config.scheduler_config
@@ -677,6 +680,7 @@ class OffloadingConnectorWorker:
                 return False
             job_id = self._generate_job_id()
             self._jobs[job_id] = (req_id, False)
+            self._load_job_label[job_id] = req.label
             self._load_job[req_id] = job_id
             return self.worker.transfer_async(
                 job_id, req.transfer_spec, label=req.label
@@ -754,8 +758,13 @@ class OffloadingConnectorWorker:
                     label=label,
                     req_id=req_id,
                 )
-            self._pcie_scheduler.flush()
-            if self._pcie_scheduler._stats["total_submitted"] == 1:
+            if self._pcie_scheduler.enable_pp_phase_aware:
+                # Evict + Restore immediately; Prefetch waits for PP idle window
+                self._pcie_scheduler.flush_evict_and_restore()
+            else:
+                self._pcie_scheduler.flush()
+            if not self._first_submit_logged and self._pcie_scheduler._stats["total_submitted"] > 0:
+                self._first_submit_logged = True
                 logger.info("PCIe Scheduler: first transfer submitted")
         else:
             # Original path: direct submission
@@ -809,8 +818,8 @@ class OffloadingConnectorWorker:
             assert transfer_result.success
             req_id, store = self._jobs.pop(job_id)
             if self._pcie_scheduler is not None and not store:
-                # H2D (Restore/Prefetch) completed - notify and flush pending
-                self._pcie_scheduler.on_transfer_completed("Restore")
+                label = self._load_job_label.pop(job_id, "Restore")
+                self._pcie_scheduler.on_transfer_completed(label)
                 self._pcie_scheduler.flush()
             if (
                 transfer_result.transfer_time

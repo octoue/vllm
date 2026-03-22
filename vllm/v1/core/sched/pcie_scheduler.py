@@ -95,7 +95,8 @@ class PCIeTransferScheduler:
         self.enable_pp_phase_aware = enable_pp_phase_aware
         self.evict_batch_size = evict_batch_size
         self._dispatch_fn = dispatch_fn
-        self._pending_transfers: list[tuple[int, int, TransferRequest]] = []
+        self._pending_h2d: list[tuple[int, int, TransferRequest]] = []  # Restore/Prefetch, min-heap
+        self._pending_d2h: list[TransferRequest] = []  # Evict, FIFO
         self._sequence_counter = 0
         self._active_h2d_count = 0
         self._pp_phase = PPPhase.IDLE
@@ -162,16 +163,20 @@ class PCIeTransferScheduler:
             _sequence=self._sequence_counter,
             extra=extra or {},
         )
-        heapq.heappush(self._pending_transfers, (priority, req._sequence, req))
+        if label == "Evict":
+            self._pending_d2h.append(req)
+        else:
+            heapq.heappush(self._pending_h2d, (priority, req._sequence, req))
 
         # Update statistics
         self._stats["total_submitted"] += 1
-        if self._stats["total_submitted"] % 20 == 0:
-            logger.debug(f"PCIe Scheduler: {self._stats['total_submitted']} submitted, "
-                         f"queue={len(self._pending_transfers)}, phase={self._pp_phase.name}")
-        current_depth = len(self._pending_transfers)
+        current_depth = len(self._pending_h2d) + len(self._pending_d2h)
         if current_depth > self._stats["max_queue_depth"]:
             self._stats["max_queue_depth"] = current_depth
+        if self._stats["total_submitted"] % 20 == 0:
+            logger.debug(f"PCIe Scheduler: {self._stats['total_submitted']} submitted, "
+                         f"H2D={len(self._pending_h2d)}, D2H={len(self._pending_d2h)}, "
+                         f"phase={self._pp_phase.name}")
 
         if self._dispatch_fn is None:
             return True
@@ -180,121 +185,77 @@ class PCIeTransferScheduler:
         return False
 
     def _flush_pending_transfers(self) -> bool:
-        """Dispatch pending transfers up to the concurrency limit.
+        """Dispatch all pending (non-PP-aware mode). D2H first, then H2D."""
+        d2h_ok = self._flush_d2h()
+        h2d_ok = self._flush_h2d_transfers()
+        return d2h_ok or h2d_ok
 
-        Evict (D2H) is not limited by max_concurrent_h2d and can run alongside
-        H2D transfers. H2D (Prefetch/Restore) respect the limit.
-
-        Returns:
-            True if at least one transfer was dispatched.
-        """
-        if self._dispatch_fn is None:
-            return False
-        dispatched = False
-        max_iter = len(self._pending_transfers) + 1  # prevent infinite loop
-        for _ in range(max_iter):
-            if not self._pending_transfers:
-                break
-            _, _, req = heapq.heappop(self._pending_transfers)
-            is_h2d = req.label in ("Prefetch", "Restore")
-            if is_h2d and self._active_h2d_count >= self.max_concurrent_h2d:
-                # At H2D limit; skip this one and try next (may be Evict).
-                self._stats["h2d_throttled"] += 1
-                heapq.heappush(
-                    self._pending_transfers,
-                    (req.priority, req._sequence, req),
-                )
-                continue
-            if is_h2d:
-                self._active_h2d_count += 1
-            success = self._dispatch_fn(req)
-            if success:
-                dispatched = True
-                # Update dispatch statistics
-                if req.label == "Restore":
-                    self._stats["restore_dispatched"] += 1
-                elif req.label == "Prefetch":
-                    self._stats["prefetch_dispatched"] += 1
-                elif req.label == "Evict":
-                    self._stats["evict_dispatched"] += 1
-            else:
-                if is_h2d:
-                    self._active_h2d_count -= 1
-                heapq.heappush(
-                    self._pending_transfers,
-                    (req.priority, req._sequence, req),
-                )
-                break
-        return dispatched
-
-    def _flush_evict_only(self) -> bool:
-        """仅分发Evict (D2H)传输，不受PP阶段限制"""
-        if self._dispatch_fn is None:
+    def _flush_d2h(self) -> bool:
+        """Dispatch Evict (D2H) transfers. Not limited by PP phase."""
+        if self._dispatch_fn is None or not self._pending_d2h:
             return False
 
         dispatched = False
-        max_iter = len(self._pending_transfers)
-        for _ in range(max_iter):
-            if not self._pending_transfers:
-                break
-
-            # 查找优先级队列中的Evict请求
-            _, _, req = heapq.heappop(self._pending_transfers)
-
-            if req.label != "Evict":
-                # 非Evict请求，放回队列
-                heapq.heappush(
-                    self._pending_transfers,
-                    (req.priority, req._sequence, req),
-                )
-                continue
-
-            # 执行Evict传输
+        while self._pending_d2h:
+            req = self._pending_d2h.pop(0)
             success = self._dispatch_fn(req)
             if success:
                 dispatched = True
                 self._stats["evict_dispatched"] += 1
             else:
-                # 失败则放回
-                heapq.heappush(
-                    self._pending_transfers,
-                    (req.priority, req._sequence, req),
-                )
+                self._pending_d2h.insert(0, req)
                 break
-
         return dispatched
 
-    def _flush_h2d_transfers(self) -> bool:
-        """分发H2D (Prefetch/Restore)传输，仅在IDLE阶段调用
-
-        遵守max_concurrent_h2d限制
-        """
-        if self._dispatch_fn is None:
+    def _flush_restore_only(self) -> bool:
+        """Dispatch only Restore (not Prefetch). For start_kv_transfers() step start."""
+        if self._dispatch_fn is None or not self._pending_h2d:
             return False
 
         dispatched = False
-        max_iter = len(self._pending_transfers)
-
-        for _ in range(max_iter):
-            if not self._pending_transfers:
+        to_push_back: list[tuple[int, int, TransferRequest]] = []
+        while self._pending_h2d:
+            _, _, req = heapq.heappop(self._pending_h2d)
+            if req.label != "Restore":
+                to_push_back.append((req.priority, req._sequence, req))
+                continue
+            if self._active_h2d_count >= self.max_concurrent_h2d:
+                to_push_back.append((req.priority, req._sequence, req))
                 break
+            self._active_h2d_count += 1
+            success = self._dispatch_fn(req)
+            if success:
+                dispatched = True
+                self._stats["restore_dispatched"] += 1
+            else:
+                self._active_h2d_count -= 1
+                to_push_back.append((req.priority, req._sequence, req))
+                break
+        for item in to_push_back:
+            heapq.heappush(self._pending_h2d, item)
+        return dispatched
 
-            # 检查H2D并发限制
+    def flush_evict_and_restore(self) -> bool:
+        """Dispatch Evict + Restore immediately. Prefetch stays queued for PP idle."""
+        d2h_ok = self._flush_d2h()
+        restore_ok = self._flush_restore_only()
+        return d2h_ok or restore_ok
+
+    def _flush_h2d_transfers(self) -> bool:
+        """Dispatch H2D (Prefetch/Restore) transfers. Called only in IDLE phase.
+
+        Respects max_concurrent_h2d limit. Restore (priority 0) before Prefetch (1).
+        """
+        if self._dispatch_fn is None or not self._pending_h2d:
+            return False
+
+        dispatched = False
+        while self._pending_h2d:
             if self._active_h2d_count >= self.max_concurrent_h2d:
                 self._stats["h2d_throttled"] += 1
                 break
 
-            _, _, req = heapq.heappop(self._pending_transfers)
-
-            # 只处理H2D传输
-            if req.label not in ("Prefetch", "Restore"):
-                heapq.heappush(
-                    self._pending_transfers,
-                    (req.priority, req._sequence, req),
-                )
-                continue
-
-            # 执行H2D传输
+            _, _, req = heapq.heappop(self._pending_h2d)
             self._active_h2d_count += 1
             success = self._dispatch_fn(req)
 
@@ -306,46 +267,37 @@ class PCIeTransferScheduler:
                     self._stats["prefetch_dispatched"] += 1
             else:
                 self._active_h2d_count -= 1
-                heapq.heappush(
-                    self._pending_transfers,
-                    (req.priority, req._sequence, req),
-                )
+                heapq.heappush(self._pending_h2d, (req.priority, req._sequence, req))
                 break
 
         return dispatched
 
     def flush(self) -> bool:
-        """分发待处理传输，考虑PP阶段和传输类型
+        """Dispatch pending transfers, considering PP phase and transfer type.
 
-        策略:
-        1. D2H (Evict) 随时可分发
-        2. H2D (Prefetch/Restore) 仅在IDLE阶段分发
-        3. Restore优先级最高，可考虑放宽限制
+        Strategy:
+        1. D2H (Evict) - dispatch anytime, Evict-first to free blocks early
+        2. H2D (Prefetch/Restore) - only in IDLE phase
         """
-        if not self._pending_transfers:
+        if not self._pending_h2d and not self._pending_d2h:
             return False
 
-        # 如果禁用PP感知，直接分发所有
+        # If PP-aware disabled, dispatch all
         if not self.enable_pp_phase_aware:
             return self._flush_pending_transfers()
 
-        # D2H (Evict) 随时可分发
-        evict_dispatched = self._flush_evict_only()
+        # D2H (Evict) first - frees blocks before H2D consumes them
+        evict_dispatched = self._flush_d2h()
 
-        # H2D (Prefetch/Restore) 仅在IDLE阶段分发
+        # H2D only in IDLE phase
         h2d_dispatched = False
         if self._pp_phase == PPPhase.IDLE:
             h2d_dispatched = self._flush_h2d_transfers()
-        else:
-            # 增加调试日志
-            h2d_count = sum(1 for _, _, r in self._pending_transfers if r.label in ('Prefetch', 'Restore'))
-            d2h_count = sum(1 for _, _, r in self._pending_transfers if r.label == 'Evict')
-            if h2d_count > 0:
-                logger.debug(
-                    f"Flush blocked: phase={self._pp_phase.name}, "
-                    f"pending={len(self._pending_transfers)} "
-                    f"(H2D={h2d_count}, D2H={d2h_count})"
-                )
+        elif self._pending_h2d:
+            logger.debug(
+                f"Flush blocked: phase={self._pp_phase.name}, "
+                f"H2D={len(self._pending_h2d)}, D2H={len(self._pending_d2h)}"
+            )
 
         return evict_dispatched or h2d_dispatched
 
@@ -358,33 +310,30 @@ class PCIeTransferScheduler:
             self._active_h2d_count -= 1
 
     def on_pp_phase_change(self, new_phase: PPPhase) -> None:
-        """处理PP阶段变化
+        """Handle PP phase changes.
 
-        - RECV: 阻止H2D分发，但允许D2H
-        - SEND: 阻止H2D分发，但允许D2H
-        - IDLE: 重置H2D计数，分发所有待处理传输
+        - RECV/SEND: Only dispatch D2H (Evict)
+        - IDLE: Reset H2D count, flush all (D2H + H2D)
         """
         if new_phase != self._pp_phase:
             logger.debug(f"PP Phase: {self._pp_phase.name} → {new_phase.name}, "
-                         f"pending={len(self._pending_transfers)}")
+                         f"H2D={len(self._pending_h2d)}, D2H={len(self._pending_d2h)}")
 
         self._pp_phase = new_phase
 
         if new_phase == PPPhase.RECV or new_phase == PPPhase.SEND:
-            # RECV/SEND阶段: 仅分发D2H (Evict)
-            self._flush_evict_only()
+            self._flush_d2h()
 
         elif new_phase == PPPhase.IDLE:
-            # IDLE阶段: 重置H2D计数 + 分发所有传输
             self._active_h2d_count = 0
-            if self._pending_transfers:  # 仅当队列非空时flush
+            if self._pending_h2d or self._pending_d2h:
                 self._stats["pp_idle_flushes"] += 1
-                self.flush()  # 分发D2H和H2D
+                self.flush()
 
     @property
     def has_pending_transfers(self) -> bool:
         """Return True if there are queued transfers."""
-        return len(self._pending_transfers) > 0
+        return len(self._pending_h2d) > 0 or len(self._pending_d2h) > 0
 
     def get_stats(self) -> dict[str, int]:
         """Return a copy of current statistics for reporting."""

@@ -23,7 +23,7 @@ pytestmark = pytest.mark.cpu_test
 
 
 def test_priority_order():
-    """Transfers are dispatched in priority order: RESTORE > PREFETCH > EVICT."""
+    """D2H (Evict) dispatched first to free blocks; then H2D: RESTORE > PREFETCH."""
     dispatched = []
 
     def capture_dispatch(req: TransferRequest) -> bool:
@@ -39,7 +39,7 @@ def test_priority_order():
     sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
     sched.flush()
 
-    assert dispatched == ["Restore", "Prefetch", "Evict"]
+    assert dispatched == ["Evict", "Restore", "Prefetch"]
 
 
 def test_same_priority_fifo():
@@ -90,7 +90,7 @@ def test_concurrency_limit():
 
 
 def test_evict_not_limited_by_h2d():
-    """Evict is not limited by max_concurrent_h2d."""
+    """Evict is not limited by max_concurrent_h2d; Evict dispatched first."""
     dispatched = []
 
     def capture_dispatch(req: TransferRequest) -> bool:
@@ -107,7 +107,7 @@ def test_evict_not_limited_by_h2d():
     sched.flush()
 
     assert "Evict" in dispatched
-    assert dispatched == ["Restore", "Restore", "Evict"]
+    assert dispatched == ["Evict", "Restore", "Restore"]
 
 
 def test_should_defer_prefetch():
