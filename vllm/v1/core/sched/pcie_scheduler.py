@@ -227,17 +227,127 @@ class PCIeTransferScheduler:
                 break
         return dispatched
 
-    def flush(self) -> bool:
-        """仅在PP空闲期分发待处理transfers
+    def _flush_evict_only(self) -> bool:
+        """仅分发Evict (D2H)传输，不受PP阶段限制"""
+        if self._dispatch_fn is None:
+            return False
 
-        如果enable_pp_phase_aware=True且当前处于RECV/SEND阶段，
-        则延迟分发以避免PCIe争抢。
+        dispatched = False
+        max_iter = len(self._pending_transfers)
+        for _ in range(max_iter):
+            if not self._pending_transfers:
+                break
+
+            # 查找优先级队列中的Evict请求
+            _, _, req = heapq.heappop(self._pending_transfers)
+
+            if req.label != "Evict":
+                # 非Evict请求，放回队列
+                heapq.heappush(
+                    self._pending_transfers,
+                    (req.priority, req._sequence, req),
+                )
+                continue
+
+            # 执行Evict传输
+            success = self._dispatch_fn(req)
+            if success:
+                dispatched = True
+                self._stats["evict_dispatched"] += 1
+            else:
+                # 失败则放回
+                heapq.heappush(
+                    self._pending_transfers,
+                    (req.priority, req._sequence, req),
+                )
+                break
+
+        return dispatched
+
+    def _flush_h2d_transfers(self) -> bool:
+        """分发H2D (Prefetch/Restore)传输，仅在IDLE阶段调用
+
+        遵守max_concurrent_h2d限制
         """
-        # 添加phase检查
-        if self.enable_pp_phase_aware and self._pp_phase != PPPhase.IDLE:
-            return False  # RECV/SEND期间不分发H2D
+        if self._dispatch_fn is None:
+            return False
 
-        return self._flush_pending_transfers()
+        dispatched = False
+        max_iter = len(self._pending_transfers)
+
+        for _ in range(max_iter):
+            if not self._pending_transfers:
+                break
+
+            # 检查H2D并发限制
+            if self._active_h2d_count >= self.max_concurrent_h2d:
+                self._stats["h2d_throttled"] += 1
+                break
+
+            _, _, req = heapq.heappop(self._pending_transfers)
+
+            # 只处理H2D传输
+            if req.label not in ("Prefetch", "Restore"):
+                heapq.heappush(
+                    self._pending_transfers,
+                    (req.priority, req._sequence, req),
+                )
+                continue
+
+            # 执行H2D传输
+            self._active_h2d_count += 1
+            success = self._dispatch_fn(req)
+
+            if success:
+                dispatched = True
+                if req.label == "Restore":
+                    self._stats["restore_dispatched"] += 1
+                elif req.label == "Prefetch":
+                    self._stats["prefetch_dispatched"] += 1
+            else:
+                self._active_h2d_count -= 1
+                heapq.heappush(
+                    self._pending_transfers,
+                    (req.priority, req._sequence, req),
+                )
+                break
+
+        return dispatched
+
+    def flush(self) -> bool:
+        """分发待处理传输，考虑PP阶段和传输类型
+
+        策略:
+        1. D2H (Evict) 随时可分发
+        2. H2D (Prefetch/Restore) 仅在IDLE阶段分发
+        3. Restore优先级最高，可考虑放宽限制
+        """
+        if not self._pending_transfers:
+            return False
+
+        # 如果禁用PP感知，直接分发所有
+        if not self.enable_pp_phase_aware:
+            return self._flush_pending_transfers()
+
+        # D2H (Evict) 随时可分发
+        evict_dispatched = self._flush_evict_only()
+
+        # H2D (Prefetch/Restore) 仅在IDLE阶段分发
+        h2d_dispatched = False
+        if self._pp_phase == PPPhase.IDLE:
+            h2d_dispatched = self._flush_h2d_transfers()
+        else:
+            # 增加调试日志
+            h2d_count = sum(1 for _, _, r in self._pending_transfers if r.label in ('Prefetch', 'Restore'))
+            d2h_count = sum(1 for _, _, r in self._pending_transfers if r.label == 'Evict')
+            if h2d_count > 0:
+                logger.debug(
+                    f"Flush blocked: phase={self._pp_phase.name}, "
+                    f"pending={len(self._pending_transfers)} "
+                    f"(H2D={h2d_count}, D2H={d2h_count})"
+                )
+
+        return evict_dispatched or h2d_dispatched
 
     def on_transfer_completed(self, label: str) -> None:
         """Notify that an H2D transfer has completed.
@@ -248,22 +358,28 @@ class PCIeTransferScheduler:
             self._active_h2d_count -= 1
 
     def on_pp_phase_change(self, new_phase: PPPhase) -> None:
-        """Handle PP phase change. In RECV phase, reset H2D count (new scheduling
-        window). In IDLE phase, flush pending H2D transfers."""
+        """处理PP阶段变化
+
+        - RECV: 阻止H2D分发，但允许D2H
+        - SEND: 阻止H2D分发，但允许D2H
+        - IDLE: 重置H2D计数，分发所有待处理传输
+        """
         if new_phase != self._pp_phase:
             logger.debug(f"PP Phase: {self._pp_phase.name} → {new_phase.name}, "
                          f"pending={len(self._pending_transfers)}")
+
         self._pp_phase = new_phase
 
-        if new_phase == PPPhase.RECV:
-            pass  # 仅更新phase，阻止后续flush
-        elif new_phase == PPPhase.SEND:
-            pass  # 继续阻止H2D分发
+        if new_phase == PPPhase.RECV or new_phase == PPPhase.SEND:
+            # RECV/SEND阶段: 仅分发D2H (Evict)
+            self._flush_evict_only()
+
         elif new_phase == PPPhase.IDLE:
-            # 空闲期：重置H2D计数 + 分发队列中transfers
+            # IDLE阶段: 重置H2D计数 + 分发所有传输
             self._active_h2d_count = 0
-            self._stats["pp_idle_flushes"] += 1
-            self._flush_pending_transfers()
+            if self._pending_transfers:  # 仅当队列非空时flush
+                self._stats["pp_idle_flushes"] += 1
+                self.flush()  # 分发D2H和H2D
 
     @property
     def has_pending_transfers(self) -> bool:
