@@ -277,7 +277,6 @@ def test_offloading_connector_creates_pcie_scheduler_when_enabled():
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
         OffloadingConnectorWorker,
     )
-    from vllm.v1.kv_offload.spec import OffloadingSpec
 
     sc = SchedulerConfig(
         max_num_seqs=8,
@@ -286,7 +285,7 @@ def test_offloading_connector_creates_pcie_scheduler_when_enabled():
         is_encoder_decoder=False,
         enable_pcie_scheduling=True,
     )
-    spec = MagicMock(spec=OffloadingSpec)
+    spec = MagicMock()
     spec.vllm_config.scheduler_config = sc
     spec.vllm_config.kv_connector_config = None
     spec.get_manager.return_value = MagicMock()
@@ -304,7 +303,6 @@ def test_offloading_connector_no_pcie_scheduler_when_disabled():
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
         OffloadingConnectorWorker,
     )
-    from vllm.v1.kv_offload.spec import OffloadingSpec
 
     sc = SchedulerConfig(
         max_num_seqs=8,
@@ -313,7 +311,7 @@ def test_offloading_connector_no_pcie_scheduler_when_disabled():
         is_encoder_decoder=False,
         enable_pcie_scheduling=False,
     )
-    spec = MagicMock(spec=OffloadingSpec)
+    spec = MagicMock()
     spec.vllm_config.scheduler_config = sc
     spec.vllm_config.kv_connector_config = None
     spec.get_manager.return_value = MagicMock()

@@ -580,6 +580,10 @@ class EngineArgs:
 
     stream_interval: int = SchedulerConfig.stream_interval
 
+    enable_pcie_scheduling: bool = SchedulerConfig.enable_pcie_scheduling
+    max_concurrent_h2d: int = SchedulerConfig.max_concurrent_h2d
+    prefetch_block_threshold: int = SchedulerConfig.prefetch_block_threshold
+
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
 
@@ -1155,6 +1159,15 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--enable-pcie-scheduling", **scheduler_kwargs["enable_pcie_scheduling"]
+        )
+        scheduler_group.add_argument(
+            "--max-concurrent-h2d", **scheduler_kwargs["max_concurrent_h2d"]
+        )
+        scheduler_group.add_argument(
+            "--prefetch-block-threshold", **scheduler_kwargs["prefetch_block_threshold"]
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -1677,6 +1690,9 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            enable_pcie_scheduling=self.enable_pcie_scheduling,
+            max_concurrent_h2d=self.max_concurrent_h2d,
+            prefetch_block_threshold=self.prefetch_block_threshold,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

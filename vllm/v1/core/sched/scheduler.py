@@ -1370,6 +1370,10 @@ class Scheduler(SchedulerInterface):
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+            if num_tokens_scheduled == 0:
+                # Request scheduled for KV load only (WAITING_FOR_REMOTE_KVS),
+                # no GPU compute tokens, skip processing model runner output.
+                continue
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure

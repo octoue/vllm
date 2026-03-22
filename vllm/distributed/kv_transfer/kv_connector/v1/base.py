@@ -279,6 +279,18 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def notify_pp_recv_start(self) -> None:
+        """PP_Recv即将开始，用于PCIe调度器延迟H2D"""
+        pass
+
+    def notify_pp_send_start(self) -> None:
+        """PP_Send即将开始，用于PCIe调度器延迟H2D"""
+        pass
+
+    def notify_pp_send_done(self) -> None:
+        """PP_Send已完成，PCIe进入空闲窗口"""
+        pass
+
     @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """

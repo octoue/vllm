@@ -100,6 +100,18 @@ class PCIeTransferScheduler:
         self._active_h2d_count = 0
         self._pp_phase = PPPhase.IDLE
 
+        # Statistics for observability
+        self._stats = {
+            "prefetch_deferred": 0,      # Prefetch requests deferred due to block pressure
+            "restore_dispatched": 0,     # Restore transfers dispatched (high priority)
+            "prefetch_dispatched": 0,    # Prefetch transfers dispatched
+            "evict_dispatched": 0,       # Evict transfers dispatched (low priority)
+            "max_queue_depth": 0,        # Maximum pending transfer queue depth
+            "h2d_throttled": 0,          # H2D transfers throttled due to concurrency limit
+            "total_submitted": 0,        # Total transfers submitted
+            "pp_idle_flushes": 0,        # Number of flushes triggered by PP idle phase
+        }
+
     def should_defer_prefetch(self, free_blocks: int) -> bool:
         """Determine whether to defer a prefetch request based on GPU block pressure.
 
@@ -112,7 +124,10 @@ class PCIeTransferScheduler:
         Returns:
             True if prefetch should be deferred, False otherwise.
         """
-        return free_blocks < self.prefetch_block_threshold
+        should_defer = free_blocks < self.prefetch_block_threshold
+        if should_defer:
+            self._stats["prefetch_deferred"] += 1
+        return should_defer
 
     def submit_transfer(
         self,
@@ -149,6 +164,12 @@ class PCIeTransferScheduler:
         )
         heapq.heappush(self._pending_transfers, (priority, req._sequence, req))
 
+        # Update statistics
+        self._stats["total_submitted"] += 1
+        current_depth = len(self._pending_transfers)
+        if current_depth > self._stats["max_queue_depth"]:
+            self._stats["max_queue_depth"] = current_depth
+
         if self._dispatch_fn is None:
             return True
 
@@ -175,6 +196,7 @@ class PCIeTransferScheduler:
             is_h2d = req.label in ("Prefetch", "Restore")
             if is_h2d and self._active_h2d_count >= self.max_concurrent_h2d:
                 # At H2D limit; skip this one and try next (may be Evict).
+                self._stats["h2d_throttled"] += 1
                 heapq.heappush(
                     self._pending_transfers,
                     (req.priority, req._sequence, req),
@@ -185,6 +207,13 @@ class PCIeTransferScheduler:
             success = self._dispatch_fn(req)
             if success:
                 dispatched = True
+                # Update dispatch statistics
+                if req.label == "Restore":
+                    self._stats["restore_dispatched"] += 1
+                elif req.label == "Prefetch":
+                    self._stats["prefetch_dispatched"] += 1
+                elif req.label == "Evict":
+                    self._stats["evict_dispatched"] += 1
             else:
                 if is_h2d:
                     self._active_h2d_count -= 1
@@ -196,11 +225,15 @@ class PCIeTransferScheduler:
         return dispatched
 
     def flush(self) -> bool:
-        """Flush pending transfers. Call when a transfer completes or PP phase changes.
+        """仅在PP空闲期分发待处理transfers
 
-        Returns:
-            True if at least one transfer was dispatched.
+        如果enable_pp_phase_aware=True且当前处于RECV/SEND阶段，
+        则延迟分发以避免PCIe争抢。
         """
+        # 添加phase检查
+        if self.enable_pp_phase_aware and self._pp_phase != PPPhase.IDLE:
+            return False  # RECV/SEND期间不分发H2D
+
         return self._flush_pending_transfers()
 
     def on_transfer_completed(self, label: str) -> None:
@@ -215,14 +248,38 @@ class PCIeTransferScheduler:
         """Handle PP phase change. In RECV phase, reset H2D count (new scheduling
         window). In IDLE phase, flush pending H2D transfers."""
         self._pp_phase = new_phase
+
         if new_phase == PPPhase.RECV:
-            # RECV marks the start of a new scheduling window; release H2D slots
-            # so the next IDLE flush can dispatch pending transfers.
-            self._active_h2d_count = 0
+            pass  # 仅更新phase，阻止后续flush
+        elif new_phase == PPPhase.SEND:
+            pass  # 继续阻止H2D分发
         elif new_phase == PPPhase.IDLE:
+            # 空闲期：重置H2D计数 + 分发队列中transfers
+            self._active_h2d_count = 0
+            self._stats["pp_idle_flushes"] += 1
             self._flush_pending_transfers()
 
     @property
     def has_pending_transfers(self) -> bool:
         """Return True if there are queued transfers."""
         return len(self._pending_transfers) > 0
+
+    def get_stats(self) -> dict[str, int]:
+        """Return a copy of current statistics for reporting."""
+        return self._stats.copy()
+
+    def log_stats(self) -> None:
+        """Log current statistics for debugging and analysis."""
+        logger.info(
+            "PCIe Scheduler Stats: submitted=%d, deferred=%d, "
+            "restore=%d, prefetch=%d, evict=%d, max_queue=%d, "
+            "throttled=%d, pp_idle_flushes=%d",
+            self._stats["total_submitted"],
+            self._stats["prefetch_deferred"],
+            self._stats["restore_dispatched"],
+            self._stats["prefetch_dispatched"],
+            self._stats["evict_dispatched"],
+            self._stats["max_queue_depth"],
+            self._stats["h2d_throttled"],
+            self._stats["pp_idle_flushes"],
+        )

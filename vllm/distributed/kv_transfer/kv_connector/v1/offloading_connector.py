@@ -160,6 +160,29 @@ class OffloadingConnector(KVConnectorBase_V1):
         if self.connector_worker is not None and (
             pcie := self.connector_worker._pcie_scheduler
         ) is not None:
+            from vllm.distributed.parallel_state import get_pp_group
+            if get_pp_group().is_last_rank:
+                # last_rank没有send操作，recv完成后直接进入IDLE
+                pcie.on_pp_phase_change(PPPhase.IDLE)
+                pcie.flush()
+            # 对于其他rank，recv_done不做任何操作，等待send_done
+
+    def notify_pp_recv_start(self) -> None:
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.on_pp_phase_change(PPPhase.RECV)
+
+    def notify_pp_send_start(self) -> None:
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.on_pp_phase_change(PPPhase.SEND)
+
+    def notify_pp_send_done(self) -> None:
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
             pcie.on_pp_phase_change(PPPhase.IDLE)
             pcie.flush()
 
@@ -817,6 +840,12 @@ class OffloadingConnectorWorker:
                 finished_sending.add(req_id)
                 del self._store_jobs[req_id]
 
+        # Periodically log PCIe scheduler statistics
+        if self._pcie_scheduler is not None:
+            total_submitted = self._pcie_scheduler._stats["total_submitted"]
+            if total_submitted > 0 and total_submitted % 100 == 0:
+                self._pcie_scheduler.log_stats()
+
         return finished_sending, finished_recving
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
@@ -830,6 +859,17 @@ class OffloadingConnectorWorker:
         kv_connector_stats = self.kv_connector_stats
         self.kv_connector_stats = OffloadingConnectorStats()
         return kv_connector_stats
+
+    def get_pcie_scheduler_stats(self) -> dict[str, int] | None:
+        """Get PCIe scheduler statistics if enabled."""
+        if self._pcie_scheduler is not None:
+            return self._pcie_scheduler.get_stats()
+        return None
+
+    def log_pcie_scheduler_stats(self) -> None:
+        """Log PCIe scheduler statistics if enabled."""
+        if self._pcie_scheduler is not None:
+            self._pcie_scheduler.log_stats()
 
 
 class OffloadPromMetrics(KVConnectorPromMetrics):

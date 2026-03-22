@@ -650,6 +650,10 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
+            # 新增：通知PCIe调度器PP_Recv即将开始
+            if has_kv_transfer_group():
+                get_kv_transfer_group().notify_pp_recv_start()
+
             with torch.profiler.record_function("PP_Recv_Activation"):
                 tensor_dict = get_pp_group().recv_tensor_dict(
                     all_gather_group=get_tp_group(),
@@ -676,12 +680,20 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
+        # 新增：通知PP_Send开始
+        if has_kv_transfer_group():
+            get_kv_transfer_group().notify_pp_send_start()
+
         with torch.profiler.record_function("PP_Send_Activation"):
             get_pp_group().send_tensor_dict(
                 output.tensors,
                 all_gather_group=get_tp_group(),
                 all_gather_tensors=all_gather_tensors,
             )
+
+        # 新增：通知PP_Send完成，PCIe进入空闲期
+        if has_kv_transfer_group():
+            get_kv_transfer_group().notify_pp_send_done()
 
         return None
 
