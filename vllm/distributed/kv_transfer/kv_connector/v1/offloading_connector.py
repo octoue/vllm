@@ -163,10 +163,13 @@ class OffloadingConnector(KVConnectorBase_V1):
         ) is not None:
             from vllm.distributed.parallel_state import get_pp_group
             if get_pp_group().is_last_rank:
-                # last_rank没有send操作，recv完成后直接进入IDLE
+                # last_rank 无后续 send，recv 后进入 IDLE（compute 期间可当空闲窗口）
                 pcie.on_pp_phase_change(PPPhase.IDLE)
                 pcie.flush()
-            # 对于其他rank，recv_done不做任何操作，等待send_done
+            else:
+                # 非 last：recv 后进入 FORWARD（本地 compute），允许全并发 H2D
+                pcie.on_pp_phase_change(PPPhase.FORWARD)
+                pcie.flush()
 
     def notify_pp_recv_start(self) -> None:
         logger.debug("notify_pp_recv_start called")
@@ -656,6 +659,7 @@ class OffloadingConnectorWorker:
                 prefetch_block_threshold=sc.prefetch_block_threshold,
                 enable_pp_phase_aware=sc.enable_pp_phase_aware,
                 evict_batch_size=sc.evict_batch_size,
+                max_queue_wait_ms=sc.max_queue_wait_ms,
                 dispatch_fn=self._dispatch_pcie_transfer,
             )
 

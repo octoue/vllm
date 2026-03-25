@@ -155,6 +155,10 @@ class SchedulerConfig:
     enable_pp_phase_aware: bool = True
     """Align H2D transfers with PP pipeline idle windows (PCIe scheduling only)."""
 
+    max_queue_wait_ms: int = Field(default=30, ge=0)
+    """Max time a Prefetch may wait in the PCIe scheduler queue before being
+    dispatched regardless of PP phase (0 = disable starvation bypass)."""
+
     evict_batch_size: int = Field(default=4, ge=1)
     """Reserved for Evict batch aggregation (PCIe scheduling only)."""
 

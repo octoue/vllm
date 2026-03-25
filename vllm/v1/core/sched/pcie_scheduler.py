@@ -79,6 +79,7 @@ class PCIeTransferScheduler:
         prefetch_block_threshold: int = 50,
         enable_pp_phase_aware: bool = True,
         evict_batch_size: int = 4,
+        max_queue_wait_ms: int = 30,
         dispatch_fn: Callable[[TransferRequest], bool] | None = None,
     ):
         """Initialize the PCIe transfer scheduler.
@@ -88,12 +89,14 @@ class PCIeTransferScheduler:
             prefetch_block_threshold: Defer prefetch when free_blocks < this value.
             enable_pp_phase_aware: Whether to align H2D with PP idle windows.
             evict_batch_size: Batch size for Evict operations (reserved for future).
+            max_queue_wait_ms: Prefetch queue wait before bypassing phase limits (0=off).
             dispatch_fn: Callback to execute a transfer; receives (spec, label).
         """
         self.max_concurrent_h2d = max_concurrent_h2d
         self.prefetch_block_threshold = prefetch_block_threshold
         self.enable_pp_phase_aware = enable_pp_phase_aware
         self.evict_batch_size = evict_batch_size
+        self.max_queue_wait_ms = max_queue_wait_ms
         self._dispatch_fn = dispatch_fn
         self._pending_h2d: list[tuple[int, int, TransferRequest]] = []  # Restore/Prefetch, min-heap
         self._pending_d2h: list[TransferRequest] = []  # Evict, FIFO
@@ -111,6 +114,7 @@ class PCIeTransferScheduler:
             "h2d_throttled": 0,          # H2D transfers throttled due to concurrency limit
             "total_submitted": 0,        # Total transfers submitted
             "pp_idle_flushes": 0,        # Number of flushes triggered by PP idle phase
+            "prefetch_starved_dispatched": 0,  # Prefetch forced out after max_queue_wait_ms
         }
 
     def should_defer_prefetch(self, free_blocks: int) -> bool:
@@ -129,6 +133,14 @@ class PCIeTransferScheduler:
         if should_defer:
             self._stats["prefetch_deferred"] += 1
         return should_defer
+
+    def _effective_max_h2d_for_phase(self) -> int:
+        """Soft PP-phase limit: full concurrency in IDLE/FORWARD; at most 1 in RECV/SEND."""
+        if not self.enable_pp_phase_aware:
+            return self.max_concurrent_h2d
+        if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
+            return self.max_concurrent_h2d
+        return min(1, self.max_concurrent_h2d)
 
     def submit_transfer(
         self,
@@ -241,17 +253,23 @@ class PCIeTransferScheduler:
         restore_ok = self._flush_restore_only()
         return d2h_ok or restore_ok
 
-    def _flush_h2d_transfers(self) -> bool:
-        """Dispatch H2D (Prefetch/Restore) transfers. Called only in IDLE phase.
+    def _flush_h2d_transfers(self, effective_max: int | None = None) -> bool:
+        """Dispatch H2D (Prefetch/Restore) transfers.
 
-        Respects max_concurrent_h2d limit. Restore (priority 0) before Prefetch (1).
+        Respects effective_max concurrent active H2D (defaults to max_concurrent_h2d).
+        Restore (priority 0) before Prefetch (1).
         """
         if self._dispatch_fn is None or not self._pending_h2d:
             return False
 
+        limit = (
+            effective_max
+            if effective_max is not None
+            else self.max_concurrent_h2d
+        )
         dispatched = False
         while self._pending_h2d:
-            if self._active_h2d_count >= self.max_concurrent_h2d:
+            if self._active_h2d_count >= limit:
                 self._stats["h2d_throttled"] += 1
                 break
 
@@ -272,12 +290,66 @@ class PCIeTransferScheduler:
 
         return dispatched
 
+    def _flush_starved_prefetches(self) -> bool:
+        """Dispatch Prefetch requests that exceeded max_queue_wait_ms in the queue.
+
+        Uses full max_concurrent_h2d for the dispatch limit (bypasses phase soft cap).
+        """
+        if (
+            self._dispatch_fn is None
+            or not self._pending_h2d
+            or self.max_queue_wait_ms <= 0
+        ):
+            return False
+
+        threshold_sec = self.max_queue_wait_ms / 1000.0
+        now = time.monotonic()
+
+        items: list[tuple[int, int, TransferRequest]] = []
+        while self._pending_h2d:
+            items.append(heapq.heappop(self._pending_h2d))
+
+        starved: list[tuple[int, int, TransferRequest]] = []
+        rest: list[tuple[int, int, TransferRequest]] = []
+        for t in items:
+            req = t[2]
+            if (
+                req.label == "Prefetch"
+                and (now - req.submit_time) >= threshold_sec
+            ):
+                starved.append(t)
+            else:
+                rest.append(t)
+
+        starved.sort(key=lambda x: x[2].submit_time)
+        dispatched = False
+        for t in starved:
+            _pri, _seq, req = t
+            if self._active_h2d_count >= self.max_concurrent_h2d:
+                rest.append(t)
+                continue
+            self._active_h2d_count += 1
+            success = self._dispatch_fn(req)
+            if success:
+                dispatched = True
+                self._stats["prefetch_dispatched"] += 1
+                self._stats["prefetch_starved_dispatched"] += 1
+            else:
+                self._active_h2d_count -= 1
+                rest.append(t)
+                break
+
+        for t in rest:
+            heapq.heappush(self._pending_h2d, t)
+        return dispatched
+
     def flush(self) -> bool:
         """Dispatch pending transfers, considering PP phase and transfer type.
 
         Strategy:
         1. D2H (Evict) - dispatch anytime, Evict-first to free blocks early
-        2. H2D (Prefetch/Restore) - only in IDLE phase
+        2. H2D - soft phase limit (IDLE/FORWARD: full concurrency; RECV/SEND: 1)
+        3. Starved Prefetch - bypass phase cap after max_queue_wait_ms
         """
         if not self._pending_h2d and not self._pending_d2h:
             return False
@@ -289,13 +361,13 @@ class PCIeTransferScheduler:
         # D2H (Evict) first - frees blocks before H2D consumes them
         evict_dispatched = self._flush_d2h()
 
-        # H2D only in IDLE phase
-        h2d_dispatched = False
-        if self._pp_phase == PPPhase.IDLE:
-            h2d_dispatched = self._flush_h2d_transfers()
-        elif self._pending_h2d:
+        effective = self._effective_max_h2d_for_phase()
+        h2d_dispatched = self._flush_h2d_transfers(effective_max=effective)
+        h2d_dispatched |= self._flush_starved_prefetches()
+
+        if not h2d_dispatched and self._pending_h2d:
             logger.debug(
-                f"Flush blocked: phase={self._pp_phase.name}, "
+                f"Flush: phase={self._pp_phase.name}, effective_h2d_cap={effective}, "
                 f"H2D={len(self._pending_h2d)}, D2H={len(self._pending_d2h)}"
             )
 
@@ -313,6 +385,7 @@ class PCIeTransferScheduler:
         """Handle PP phase changes.
 
         - RECV/SEND: Only dispatch D2H (Evict)
+        - FORWARD: Evict + H2D with soft limits (full concurrency vs RECV/SEND)
         - IDLE: Reset H2D count, flush all (D2H + H2D)
         """
         if new_phase != self._pp_phase:
@@ -323,6 +396,10 @@ class PCIeTransferScheduler:
 
         if new_phase == PPPhase.RECV or new_phase == PPPhase.SEND:
             self._flush_d2h()
+
+        elif new_phase == PPPhase.FORWARD:
+            if self._pending_h2d or self._pending_d2h:
+                self.flush()
 
         elif new_phase == PPPhase.IDLE:
             self._active_h2d_count = 0
@@ -344,7 +421,7 @@ class PCIeTransferScheduler:
         logger.info(
             "PCIe Scheduler Stats: submitted=%d, deferred=%d, "
             "restore=%d, prefetch=%d, evict=%d, max_queue=%d, "
-            "throttled=%d, pp_idle_flushes=%d",
+            "throttled=%d, pp_idle_flushes=%d, prefetch_starved=%d",
             self._stats["total_submitted"],
             self._stats["prefetch_deferred"],
             self._stats["restore_dispatched"],
@@ -353,4 +430,5 @@ class PCIeTransferScheduler:
             self._stats["max_queue_depth"],
             self._stats["h2d_throttled"],
             self._stats["pp_idle_flushes"],
+            self._stats["prefetch_starved_dispatched"],
         )

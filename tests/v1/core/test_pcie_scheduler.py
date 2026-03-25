@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the PCIe transfer scheduler and its integration."""
 
+import time
+
 import pytest
 
 from vllm.v1.core.sched.pcie_scheduler import (
@@ -140,6 +142,58 @@ def test_pp_phase_idle_triggers_flush():
 
     sched.on_pp_phase_change(PPPhase.IDLE)
     assert len(dispatched) == 2
+
+
+def test_prefetch_starved_dispatched_after_queue_wait():
+    """Prefetch waiting longer than max_queue_wait_ms bypasses RECV soft cap."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.req_id or "")
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=2,
+        enable_pp_phase_aware=True,
+        max_queue_wait_ms=30,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="first")
+    sched.flush()
+    assert dispatched == ["first"]
+    assert sched._active_h2d_count == 1
+
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="second")
+    sched.on_pp_phase_change(PPPhase.RECV)
+    sched.flush()
+    assert dispatched == ["first"]
+
+    time.sleep(0.04)
+    sched.flush()
+    assert dispatched == ["first", "second"]
+    assert sched._stats["prefetch_starved_dispatched"] >= 1
+
+
+def test_forward_phase_allows_full_h2d_concurrency():
+    """FORWARD uses full max_concurrent_h2d (soft limit, not RECV cap of 1)."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=2,
+        enable_pp_phase_aware=True,
+        max_queue_wait_ms=0,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="a")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="b")
+    sched.on_pp_phase_change(PPPhase.FORWARD)
+    sched.flush()
+    assert len(dispatched) == 2
+    assert sched._active_h2d_count == 2
 
 
 def test_pp_phase_recv_no_flush():
