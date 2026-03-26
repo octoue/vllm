@@ -660,6 +660,10 @@ class OffloadingConnectorWorker:
                 enable_pp_phase_aware=sc.enable_pp_phase_aware,
                 evict_batch_size=sc.evict_batch_size,
                 max_queue_wait_ms=sc.max_queue_wait_ms,
+                adaptive_h2d_concurrency=sc.adaptive_h2d_concurrency,
+                adaptive_h2d_high_load_threshold=sc.adaptive_h2d_high_load_threshold,
+                adaptive_h2d_high_load_concurrency=sc.adaptive_h2d_high_load_concurrency,
+                max_transfer_wait_ms=sc.max_transfer_wait_ms,
                 dispatch_fn=self._dispatch_pcie_transfer,
             )
 
@@ -686,6 +690,8 @@ class OffloadingConnectorWorker:
             self._jobs[job_id] = (req_id, False)
             self._load_job_label[job_id] = req.label
             self._load_job[req_id] = job_id
+            # Store job_id in request for end-to-end tracking
+            req.extra["job_id"] = job_id
             return self.worker.transfer_async(
                 job_id, req.transfer_spec, label=req.label
             )
@@ -823,7 +829,8 @@ class OffloadingConnectorWorker:
             req_id, store = self._jobs.pop(job_id)
             if self._pcie_scheduler is not None and not store:
                 label = self._load_job_label.pop(job_id, "Restore")
-                self._pcie_scheduler.on_transfer_completed(label)
+                # Pass job_id for end-to-end tracking
+                self._pcie_scheduler.on_transfer_completed(label, req_id=job_id)
                 self._pcie_scheduler.flush()
             if (
                 transfer_result.transfer_time

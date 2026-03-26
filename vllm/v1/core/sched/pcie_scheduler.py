@@ -55,6 +55,7 @@ class TransferRequest:
     label: str
     req_id: str | None = None
     submit_time: float = field(default_factory=time.monotonic)
+    dispatch_time: float | None = None  # Time when dispatched (for end-to-end tracking)
     _sequence: int = field(default=0, repr=False)
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -80,6 +81,10 @@ class PCIeTransferScheduler:
         enable_pp_phase_aware: bool = True,
         evict_batch_size: int = 4,
         max_queue_wait_ms: int = 30,
+        adaptive_h2d_concurrency: bool = False,
+        adaptive_h2d_high_load_threshold: int = 5,
+        adaptive_h2d_high_load_concurrency: int = 4,
+        max_transfer_wait_ms: int = 500,
         dispatch_fn: Callable[[TransferRequest], bool] | None = None,
     ):
         """Initialize the PCIe transfer scheduler.
@@ -90,19 +95,30 @@ class PCIeTransferScheduler:
             enable_pp_phase_aware: Whether to align H2D with PP idle windows.
             evict_batch_size: Batch size for Evict operations (reserved for future).
             max_queue_wait_ms: Prefetch queue wait before bypassing phase limits (0=off).
+            adaptive_h2d_concurrency: Enable dynamic H2D concurrency based on load.
+            adaptive_h2d_high_load_threshold: Queue depth threshold for high load.
+            adaptive_h2d_high_load_concurrency: H2D concurrency limit under high load.
+            max_transfer_wait_ms: End-to-end timeout for Prefetch transfers (0=off).
             dispatch_fn: Callback to execute a transfer; receives (spec, label).
         """
-        self.max_concurrent_h2d = max_concurrent_h2d
+        self.base_max_concurrent_h2d = max_concurrent_h2d
         self.prefetch_block_threshold = prefetch_block_threshold
         self.enable_pp_phase_aware = enable_pp_phase_aware
         self.evict_batch_size = evict_batch_size
         self.max_queue_wait_ms = max_queue_wait_ms
+        self.adaptive_h2d_concurrency = adaptive_h2d_concurrency
+        self.adaptive_h2d_high_load_threshold = adaptive_h2d_high_load_threshold
+        self.adaptive_h2d_high_load_concurrency = adaptive_h2d_high_load_concurrency
+        self.max_transfer_wait_ms = max_transfer_wait_ms
         self._dispatch_fn = dispatch_fn
         self._pending_h2d: list[tuple[int, int, TransferRequest]] = []  # Restore/Prefetch, min-heap
         self._pending_d2h: list[TransferRequest] = []  # Evict, FIFO
         self._sequence_counter = 0
         self._active_h2d_count = 0
         self._pp_phase = PPPhase.IDLE
+
+        # Track dispatched Prefetch requests for end-to-end monitoring
+        self._dispatched_prefetches: dict[int, TransferRequest] = {}
 
         # Statistics for observability
         self._stats = {
@@ -115,7 +131,14 @@ class PCIeTransferScheduler:
             "total_submitted": 0,        # Total transfers submitted
             "pp_idle_flushes": 0,        # Number of flushes triggered by PP idle phase
             "prefetch_starved_dispatched": 0,  # Prefetch forced out after max_queue_wait_ms
+            "prefetch_stuck": 0,         # Prefetch exceeded max_transfer_wait_ms
+            "dynamic_concurrency_triggered": 0,  # Times high-load concurrency was used
         }
+
+    @property
+    def max_concurrent_h2d(self) -> int:
+        """Backward compatibility: return current effective max H2D concurrency."""
+        return self._get_dynamic_max_h2d()
 
     def should_defer_prefetch(self, free_blocks: int) -> bool:
         """Determine whether to defer a prefetch request based on GPU block pressure.
@@ -134,13 +157,30 @@ class PCIeTransferScheduler:
             self._stats["prefetch_deferred"] += 1
         return should_defer
 
+    def _get_dynamic_max_h2d(self) -> int:
+        """Compute dynamic H2D concurrency limit based on queue depth.
+
+        Returns base_max_concurrent_h2d under normal load, or
+        adaptive_h2d_high_load_concurrency when queue depth exceeds threshold.
+        """
+        if not self.adaptive_h2d_concurrency:
+            return self.base_max_concurrent_h2d
+
+        pending_count = len(self._pending_h2d)
+        if pending_count >= self.adaptive_h2d_high_load_threshold:
+            self._stats["dynamic_concurrency_triggered"] += 1
+            return self.adaptive_h2d_high_load_concurrency
+
+        return self.base_max_concurrent_h2d
+
     def _effective_max_h2d_for_phase(self) -> int:
         """Soft PP-phase limit: full concurrency in IDLE/FORWARD; at most 1 in RECV/SEND."""
+        base_limit = self._get_dynamic_max_h2d()
         if not self.enable_pp_phase_aware:
-            return self.max_concurrent_h2d
+            return base_limit
         if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
-            return self.max_concurrent_h2d
-        return min(1, self.max_concurrent_h2d)
+            return base_limit
+        return min(1, base_limit)
 
     def submit_transfer(
         self,
@@ -225,13 +265,14 @@ class PCIeTransferScheduler:
             return False
 
         dispatched = False
+        limit = self._get_dynamic_max_h2d()
         to_push_back: list[tuple[int, int, TransferRequest]] = []
         while self._pending_h2d:
             _, _, req = heapq.heappop(self._pending_h2d)
             if req.label != "Restore":
                 to_push_back.append((req.priority, req._sequence, req))
                 continue
-            if self._active_h2d_count >= self.max_concurrent_h2d:
+            if self._active_h2d_count >= limit:
                 to_push_back.append((req.priority, req._sequence, req))
                 break
             self._active_h2d_count += 1
@@ -265,7 +306,7 @@ class PCIeTransferScheduler:
         limit = (
             effective_max
             if effective_max is not None
-            else self.max_concurrent_h2d
+            else self._get_dynamic_max_h2d()
         )
         dispatched = False
         while self._pending_h2d:
@@ -275,6 +316,7 @@ class PCIeTransferScheduler:
 
             _, _, req = heapq.heappop(self._pending_h2d)
             self._active_h2d_count += 1
+            req.dispatch_time = time.monotonic()  # Track dispatch time
             success = self._dispatch_fn(req)
 
             if success:
@@ -283,8 +325,13 @@ class PCIeTransferScheduler:
                     self._stats["restore_dispatched"] += 1
                 elif req.label == "Prefetch":
                     self._stats["prefetch_dispatched"] += 1
+                    # Track dispatched Prefetch using job_id if available
+                    job_id = req.extra.get("job_id")
+                    if job_id is not None:
+                        self._dispatched_prefetches[job_id] = req
             else:
                 self._active_h2d_count -= 1
+                req.dispatch_time = None  # Reset if dispatch failed
                 heapq.heappush(self._pending_h2d, (req.priority, req._sequence, req))
                 break
 
@@ -323,19 +370,26 @@ class PCIeTransferScheduler:
 
         starved.sort(key=lambda x: x[2].submit_time)
         dispatched = False
+        dynamic_limit = self._get_dynamic_max_h2d()
         for t in starved:
             _pri, _seq, req = t
-            if self._active_h2d_count >= self.max_concurrent_h2d:
+            if self._active_h2d_count >= dynamic_limit:
                 rest.append(t)
                 continue
             self._active_h2d_count += 1
+            req.dispatch_time = time.monotonic()  # Track dispatch time
             success = self._dispatch_fn(req)
             if success:
                 dispatched = True
                 self._stats["prefetch_dispatched"] += 1
                 self._stats["prefetch_starved_dispatched"] += 1
+                # Track dispatched Prefetch using job_id if available
+                job_id = req.extra.get("job_id")
+                if job_id is not None:
+                    self._dispatched_prefetches[job_id] = req
             else:
                 self._active_h2d_count -= 1
+                req.dispatch_time = None  # Reset if dispatch failed
                 rest.append(t)
                 break
 
@@ -373,13 +427,25 @@ class PCIeTransferScheduler:
 
         return evict_dispatched or h2d_dispatched
 
-    def on_transfer_completed(self, label: str) -> None:
+    def on_transfer_completed(self, label: str, req_id: Any = None) -> None:
         """Notify that an H2D transfer has completed.
 
         Call from the offloading handler when a Prefetch or Restore finishes.
         """
         if label in ("Prefetch", "Restore") and self._active_h2d_count > 0:
             self._active_h2d_count -= 1
+
+        # End-to-end monitoring for Prefetch requests
+        if label == "Prefetch" and req_id is not None:
+            if req_id in self._dispatched_prefetches:
+                req = self._dispatched_prefetches.pop(req_id)
+                elapsed_ms = (time.monotonic() - req.submit_time) * 1000.0
+                if self.max_transfer_wait_ms > 0 and elapsed_ms > self.max_transfer_wait_ms:
+                    self._stats["prefetch_stuck"] += 1
+                    logger.warning(
+                        f"Prefetch exceeded max_transfer_wait: {elapsed_ms:.1f}ms "
+                        f"(threshold={self.max_transfer_wait_ms}ms), req_id={req.req_id}"
+                    )
 
     def on_pp_phase_change(self, new_phase: PPPhase) -> None:
         """Handle PP phase changes.
@@ -421,7 +487,8 @@ class PCIeTransferScheduler:
         logger.info(
             "PCIe Scheduler Stats: submitted=%d, deferred=%d, "
             "restore=%d, prefetch=%d, evict=%d, max_queue=%d, "
-            "throttled=%d, pp_idle_flushes=%d, prefetch_starved=%d",
+            "throttled=%d, pp_idle_flushes=%d, prefetch_starved=%d, "
+            "prefetch_stuck=%d, dynamic_concurrency=%d",
             self._stats["total_submitted"],
             self._stats["prefetch_deferred"],
             self._stats["restore_dispatched"],
@@ -431,4 +498,6 @@ class PCIeTransferScheduler:
             self._stats["h2d_throttled"],
             self._stats["pp_idle_flushes"],
             self._stats["prefetch_starved_dispatched"],
+            self._stats["prefetch_stuck"],
+            self._stats["dynamic_concurrency_triggered"],
         )

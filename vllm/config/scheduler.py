@@ -162,6 +162,21 @@ class SchedulerConfig:
     evict_batch_size: int = Field(default=4, ge=1)
     """Reserved for Evict batch aggregation (PCIe scheduling only)."""
 
+    # Dynamic H2D concurrency control (Optimization 1)
+    adaptive_h2d_concurrency: bool = False
+    """Enable dynamic H2D concurrency based on queue depth to avoid artificial bottlenecks."""
+
+    adaptive_h2d_high_load_threshold: int = Field(default=5, ge=1)
+    """Queue depth threshold to trigger high-load concurrency mode."""
+
+    adaptive_h2d_high_load_concurrency: int = Field(default=4, ge=1)
+    """H2D concurrency limit when queue depth exceeds threshold."""
+
+    # End-to-end starvation monitoring (Optimization 2)
+    max_transfer_wait_ms: int = Field(default=500, ge=0)
+    """End-to-end timeout for Prefetch transfers from submit to completion.
+    Logs warning if exceeded (0 = disable monitoring)."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

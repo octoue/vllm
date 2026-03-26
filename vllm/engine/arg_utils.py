@@ -585,6 +585,14 @@ class EngineArgs:
     prefetch_block_threshold: int = SchedulerConfig.prefetch_block_threshold
     enable_pp_phase_aware: bool = SchedulerConfig.enable_pp_phase_aware
     max_queue_wait_ms: int = SchedulerConfig.max_queue_wait_ms
+    adaptive_h2d_concurrency: bool = SchedulerConfig.adaptive_h2d_concurrency
+    adaptive_h2d_high_load_threshold: int = (
+        SchedulerConfig.adaptive_h2d_high_load_threshold
+    )
+    adaptive_h2d_high_load_concurrency: int = (
+        SchedulerConfig.adaptive_h2d_high_load_concurrency
+    )
+    max_transfer_wait_ms: int = SchedulerConfig.max_transfer_wait_ms
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
@@ -1176,6 +1184,21 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--max-queue-wait-ms", **scheduler_kwargs["max_queue_wait_ms"]
         )
+        scheduler_group.add_argument(
+            "--adaptive-h2d-concurrency",
+            **scheduler_kwargs["adaptive_h2d_concurrency"],
+        )
+        scheduler_group.add_argument(
+            "--adaptive-h2d-high-load-threshold",
+            **scheduler_kwargs["adaptive_h2d_high_load_threshold"],
+        )
+        scheduler_group.add_argument(
+            "--adaptive-h2d-high-load-concurrency",
+            **scheduler_kwargs["adaptive_h2d_high_load_concurrency"],
+        )
+        scheduler_group.add_argument(
+            "--max-transfer-wait-ms", **scheduler_kwargs["max_transfer_wait_ms"]
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -1703,6 +1726,10 @@ class EngineArgs:
             prefetch_block_threshold=self.prefetch_block_threshold,
             enable_pp_phase_aware=self.enable_pp_phase_aware,
             max_queue_wait_ms=self.max_queue_wait_ms,
+            adaptive_h2d_concurrency=self.adaptive_h2d_concurrency,
+            adaptive_h2d_high_load_threshold=self.adaptive_h2d_high_load_threshold,
+            adaptive_h2d_high_load_concurrency=self.adaptive_h2d_high_load_concurrency,
+            max_transfer_wait_ms=self.max_transfer_wait_ms,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
