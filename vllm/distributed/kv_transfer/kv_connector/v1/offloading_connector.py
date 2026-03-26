@@ -658,6 +658,7 @@ class OffloadingConnectorWorker:
                 max_concurrent_h2d=sc.max_concurrent_h2d,
                 prefetch_block_threshold=sc.prefetch_block_threshold,
                 enable_pp_phase_aware=sc.enable_pp_phase_aware,
+                pp_phase_h2d_policy=sc.pp_phase_h2d_policy,
                 evict_batch_size=sc.evict_batch_size,
                 max_queue_wait_ms=sc.max_queue_wait_ms,
                 adaptive_h2d_concurrency=sc.adaptive_h2d_concurrency,

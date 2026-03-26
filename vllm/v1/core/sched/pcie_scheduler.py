@@ -79,6 +79,7 @@ class PCIeTransferScheduler:
         max_concurrent_h2d: int = 2,
         prefetch_block_threshold: int = 50,
         enable_pp_phase_aware: bool = True,
+        pp_phase_h2d_policy: str = "soft",
         evict_batch_size: int = 4,
         max_queue_wait_ms: int = 30,
         adaptive_h2d_concurrency: bool = False,
@@ -93,6 +94,10 @@ class PCIeTransferScheduler:
             max_concurrent_h2d: Maximum concurrent H2D (Prefetch/Restore) transfers.
             prefetch_block_threshold: Defer prefetch when free_blocks < this value.
             enable_pp_phase_aware: Whether to align H2D with PP idle windows.
+            pp_phase_h2d_policy: H2D policy during PP RECV/SEND phases:
+                - "soft": Allow up to 1 concurrent H2D (default)
+                - "hard": Block all H2D transfers
+                - "restore_only": Only allow high-priority Restore transfers
             evict_batch_size: Batch size for Evict operations (reserved for future).
             max_queue_wait_ms: Prefetch queue wait before bypassing phase limits (0=off).
             adaptive_h2d_concurrency: Enable dynamic H2D concurrency based on load.
@@ -104,6 +109,7 @@ class PCIeTransferScheduler:
         self.base_max_concurrent_h2d = max_concurrent_h2d
         self.prefetch_block_threshold = prefetch_block_threshold
         self.enable_pp_phase_aware = enable_pp_phase_aware
+        self.pp_phase_h2d_policy = pp_phase_h2d_policy
         self.evict_batch_size = evict_batch_size
         self.max_queue_wait_ms = max_queue_wait_ms
         self.adaptive_h2d_concurrency = adaptive_h2d_concurrency
@@ -115,6 +121,7 @@ class PCIeTransferScheduler:
         self._pending_d2h: list[TransferRequest] = []  # Evict, FIFO
         self._sequence_counter = 0
         self._active_h2d_count = 0
+        self._active_d2h_count = 0  # Track active D2H transfers for conflict avoidance
         self._pp_phase = PPPhase.IDLE
 
         # Track dispatched Prefetch requests for end-to-end monitoring
@@ -173,14 +180,36 @@ class PCIeTransferScheduler:
 
         return self.base_max_concurrent_h2d
 
+    def _has_pending_restore(self) -> bool:
+        """Check if there are pending Restore requests in the queue."""
+        for _, _, req in self._pending_h2d:
+            if req.label == "Restore":
+                return True
+        return False
+
     def _effective_max_h2d_for_phase(self) -> int:
-        """Soft PP-phase limit: full concurrency in IDLE/FORWARD; at most 1 in RECV/SEND."""
+        """Compute effective H2D limit based on PP phase and configured policy.
+
+        Returns:
+            Effective max concurrent H2D based on current PP phase and policy:
+            - IDLE/FORWARD: Full concurrency (base_max_concurrent_h2d)
+            - RECV/SEND with "soft" policy: Allow 1 concurrent H2D
+            - RECV/SEND with "hard" policy: Block all H2D (return 0)
+            - RECV/SEND with "restore_only" policy: Allow 1 if Restore pending, else 0
+        """
         base_limit = self._get_dynamic_max_h2d()
         if not self.enable_pp_phase_aware:
             return base_limit
         if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
             return base_limit
-        return min(1, base_limit)
+
+        # PP communication phase (RECV/SEND) - apply policy
+        if self.pp_phase_h2d_policy == "hard":
+            return 0
+        elif self.pp_phase_h2d_policy == "restore_only":
+            return 1 if self._has_pending_restore() else 0
+        else:  # "soft" (default)
+            return min(1, base_limit)
 
     def submit_transfer(
         self,
@@ -253,6 +282,7 @@ class PCIeTransferScheduler:
             success = self._dispatch_fn(req)
             if success:
                 dispatched = True
+                self._active_d2h_count += 1  # Track active D2H for conflict avoidance
                 self._stats["evict_dispatched"] += 1
             else:
                 self._pending_d2h.insert(0, req)
@@ -403,7 +433,8 @@ class PCIeTransferScheduler:
         Strategy:
         1. D2H (Evict) - dispatch anytime, Evict-first to free blocks early
         2. H2D - soft phase limit (IDLE/FORWARD: full concurrency; RECV/SEND: 1)
-        3. Starved Prefetch - bypass phase cap after max_queue_wait_ms
+        3. H2D-D2H conflict avoidance - reduce H2D concurrency when D2H is active
+        4. Starved Prefetch - bypass phase cap after max_queue_wait_ms
         """
         if not self._pending_h2d and not self._pending_d2h:
             return False
@@ -415,25 +446,34 @@ class PCIeTransferScheduler:
         # D2H (Evict) first - frees blocks before H2D consumes them
         evict_dispatched = self._flush_d2h()
 
+        # Reduce H2D concurrency if there are active D2H transfers to avoid PCIe conflict
         effective = self._effective_max_h2d_for_phase()
-        h2d_dispatched = self._flush_h2d_transfers(effective_max=effective)
+        if self._active_d2h_count > 0:
+            effective_h2d = max(0, effective - self._active_d2h_count)
+        else:
+            effective_h2d = effective
+
+        h2d_dispatched = self._flush_h2d_transfers(effective_max=effective_h2d)
         h2d_dispatched |= self._flush_starved_prefetches()
 
         if not h2d_dispatched and self._pending_h2d:
             logger.debug(
-                f"Flush: phase={self._pp_phase.name}, effective_h2d_cap={effective}, "
+                f"Flush: phase={self._pp_phase.name}, effective_h2d_cap={effective_h2d}, "
+                f"active_d2h={self._active_d2h_count}, "
                 f"H2D={len(self._pending_h2d)}, D2H={len(self._pending_d2h)}"
             )
 
         return evict_dispatched or h2d_dispatched
 
     def on_transfer_completed(self, label: str, req_id: Any = None) -> None:
-        """Notify that an H2D transfer has completed.
+        """Notify that a transfer has completed.
 
-        Call from the offloading handler when a Prefetch or Restore finishes.
+        Call from the offloading handler when a Prefetch, Restore, or Evict finishes.
         """
         if label in ("Prefetch", "Restore") and self._active_h2d_count > 0:
             self._active_h2d_count -= 1
+        elif label == "Evict" and self._active_d2h_count > 0:
+            self._active_d2h_count -= 1
 
         # End-to-end monitoring for Prefetch requests
         if label == "Prefetch" and req_id is not None:

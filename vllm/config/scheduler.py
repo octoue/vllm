@@ -155,6 +155,13 @@ class SchedulerConfig:
     enable_pp_phase_aware: bool = True
     """Align H2D transfers with PP pipeline idle windows (PCIe scheduling only)."""
 
+    pp_phase_h2d_policy: Literal["soft", "hard", "restore_only"] = "soft"
+    """H2D transfer policy during PP communication phases (RECV/SEND):
+    - "soft": Allow up to 1 concurrent H2D (current behavior, balances throughput vs latency)
+    - "hard": Block all H2D transfers (minimizes PP interference, may cause starvation)
+    - "restore_only": Only allow high-priority Restore transfers (protects critical path)
+    Only applies when enable_pp_phase_aware=True."""
+
     max_queue_wait_ms: int = Field(default=30, ge=0)
     """Max time a Prefetch may wait in the PCIe scheduler queue before being
     dispatched regardless of PP phase (0 = disable starvation bypass)."""

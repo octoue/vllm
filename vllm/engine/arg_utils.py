@@ -584,6 +584,7 @@ class EngineArgs:
     max_concurrent_h2d: int = SchedulerConfig.max_concurrent_h2d
     prefetch_block_threshold: int = SchedulerConfig.prefetch_block_threshold
     enable_pp_phase_aware: bool = SchedulerConfig.enable_pp_phase_aware
+    pp_phase_h2d_policy: str = SchedulerConfig.pp_phase_h2d_policy
     max_queue_wait_ms: int = SchedulerConfig.max_queue_wait_ms
     adaptive_h2d_concurrency: bool = SchedulerConfig.adaptive_h2d_concurrency
     adaptive_h2d_high_load_threshold: int = (
@@ -1182,6 +1183,9 @@ class EngineArgs:
             "--enable-pp-phase-aware", **scheduler_kwargs["enable_pp_phase_aware"]
         )
         scheduler_group.add_argument(
+            "--pp-phase-h2d-policy", **scheduler_kwargs["pp_phase_h2d_policy"]
+        )
+        scheduler_group.add_argument(
             "--max-queue-wait-ms", **scheduler_kwargs["max_queue_wait_ms"]
         )
         scheduler_group.add_argument(
@@ -1725,6 +1729,7 @@ class EngineArgs:
             max_concurrent_h2d=self.max_concurrent_h2d,
             prefetch_block_threshold=self.prefetch_block_threshold,
             enable_pp_phase_aware=self.enable_pp_phase_aware,
+            pp_phase_h2d_policy=self.pp_phase_h2d_policy,
             max_queue_wait_ms=self.max_queue_wait_ms,
             adaptive_h2d_concurrency=self.adaptive_h2d_concurrency,
             adaptive_h2d_high_load_threshold=self.adaptive_h2d_high_load_threshold,
