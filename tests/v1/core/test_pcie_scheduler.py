@@ -155,6 +155,7 @@ def test_prefetch_starved_dispatched_after_queue_wait():
     sched = PCIeTransferScheduler(
         max_concurrent_h2d=2,
         enable_pp_phase_aware=True,
+        pp_phase_h2d_policy="soft",
         max_queue_wait_ms=30,
         dispatch_fn=capture_dispatch,
     )
@@ -174,8 +175,8 @@ def test_prefetch_starved_dispatched_after_queue_wait():
     assert sched._stats["prefetch_starved_dispatched"] >= 1
 
 
-def test_forward_phase_allows_full_h2d_concurrency():
-    """FORWARD uses full max_concurrent_h2d (soft limit, not RECV cap of 1)."""
+def test_forward_phase_caps_h2d_for_soft_policy():
+    """FORWARD caps H2D at 1 for soft policy; second Prefetch flushes after IDLE."""
     dispatched: list[str] = []
 
     def capture_dispatch(req: TransferRequest) -> bool:
@@ -185,6 +186,7 @@ def test_forward_phase_allows_full_h2d_concurrency():
     sched = PCIeTransferScheduler(
         max_concurrent_h2d=2,
         enable_pp_phase_aware=True,
+        pp_phase_h2d_policy="soft",
         max_queue_wait_ms=0,
         dispatch_fn=capture_dispatch,
     )
@@ -192,8 +194,56 @@ def test_forward_phase_allows_full_h2d_concurrency():
     sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="b")
     sched.on_pp_phase_change(PPPhase.FORWARD)
     sched.flush()
+    assert len(dispatched) == 1
+    assert sched._active_h2d_count == 1
+
+    sched.on_transfer_completed("Prefetch")
+    sched.on_pp_phase_change(PPPhase.IDLE)
+    sched.flush()
+    assert len(dispatched) == 2
+    assert sched._active_h2d_count == 1
+
+
+def test_idle_only_policy_blocks_h2d_until_idle():
+    """idle_only: no H2D during FORWARD; both Prefetch dispatch after IDLE."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=2,
+        enable_pp_phase_aware=True,
+        pp_phase_h2d_policy="idle_only",
+        max_queue_wait_ms=0,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="a")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="b")
+    sched.on_pp_phase_change(PPPhase.FORWARD)
+    sched.flush()
+    assert dispatched == []
+
+    sched.on_pp_phase_change(PPPhase.IDLE)
+    sched.flush()
     assert len(dispatched) == 2
     assert sched._active_h2d_count == 2
+
+
+def test_idle_only_starvation_uses_at_least_100ms_threshold():
+    """idle_only raises effective starvation wait to max(config, 100ms)."""
+    sched = PCIeTransferScheduler(
+        pp_phase_h2d_policy="idle_only",
+        max_queue_wait_ms=30,
+    )
+    assert sched._starvation_wait_ms == 100
+
+    sched2 = PCIeTransferScheduler(
+        pp_phase_h2d_policy="soft",
+        max_queue_wait_ms=30,
+    )
+    assert sched2._starvation_wait_ms == 30
 
 
 def test_pp_phase_recv_no_flush():

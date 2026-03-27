@@ -275,9 +275,11 @@ class PromptTokenStats:
 
         self.computed += prompt_len - num_cached_tokens
         self.external_kv_transfer += num_external_computed_tokens
-        self.local_cache_hit += (
-            num_cached_tokens + recomputed - num_external_computed_tokens
-        )
+        # local_cache_hit should be non-negative. In edge cases where
+        # num_external_computed_tokens > num_cached_tokens (which shouldn't
+        # happen but can due to accounting issues), clamp to 0.
+        local_cache_hit_delta = num_cached_tokens + recomputed - num_external_computed_tokens
+        self.local_cache_hit += max(0, local_cache_hit_delta)
         self.cached_tokens += num_cached_tokens
         self.recomputed_tokens += recomputed
         self.total += prompt_len

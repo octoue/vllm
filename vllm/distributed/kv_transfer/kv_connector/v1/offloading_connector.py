@@ -167,7 +167,7 @@ class OffloadingConnector(KVConnectorBase_V1):
                 pcie.on_pp_phase_change(PPPhase.IDLE)
                 pcie.flush()
             else:
-                # 非 last：recv 后进入 FORWARD（本地 compute），允许全并发 H2D
+                # 非 last：recv 后进入 FORWARD（本地 compute）；H2D 由 phase 策略限制
                 pcie.on_pp_phase_change(PPPhase.FORWARD)
                 pcie.flush()
 

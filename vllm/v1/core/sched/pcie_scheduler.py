@@ -79,7 +79,7 @@ class PCIeTransferScheduler:
         max_concurrent_h2d: int = 2,
         prefetch_block_threshold: int = 50,
         enable_pp_phase_aware: bool = True,
-        pp_phase_h2d_policy: str = "soft",
+        pp_phase_h2d_policy: str = "idle_only",
         evict_batch_size: int = 4,
         max_queue_wait_ms: int = 30,
         adaptive_h2d_concurrency: bool = False,
@@ -94,12 +94,16 @@ class PCIeTransferScheduler:
             max_concurrent_h2d: Maximum concurrent H2D (Prefetch/Restore) transfers.
             prefetch_block_threshold: Defer prefetch when free_blocks < this value.
             enable_pp_phase_aware: Whether to align H2D with PP idle windows.
-            pp_phase_h2d_policy: H2D policy during PP RECV/SEND phases:
-                - "soft": Allow up to 1 concurrent H2D (default)
-                - "hard": Block all H2D transfers
-                - "restore_only": Only allow high-priority Restore transfers
+            pp_phase_h2d_policy: H2D policy when PP phase-aware scheduling is on:
+                - "idle_only": Only dispatch H2D in PP IDLE (recommended default;
+                  uses longer prefetch starvation bypass, see max_queue_wait_ms)
+                - "soft": IDLE full concurrency; FORWARD/RECV/SEND at most 1 H2D
+                - "hard": IDLE full concurrency; block H2D during FORWARD/RECV/SEND
+                - "restore_only": IDLE full; during FORWARD/RECV/SEND allow H2D only
+                  if a Restore request is pending
             evict_batch_size: Batch size for Evict operations (reserved for future).
             max_queue_wait_ms: Prefetch queue wait before bypassing phase limits (0=off).
+                Under idle_only, effective starvation threshold is at least 100ms.
             adaptive_h2d_concurrency: Enable dynamic H2D concurrency based on load.
             adaptive_h2d_high_load_threshold: Queue depth threshold for high load.
             adaptive_h2d_high_load_concurrency: H2D concurrency limit under high load.
@@ -112,6 +116,12 @@ class PCIeTransferScheduler:
         self.pp_phase_h2d_policy = pp_phase_h2d_policy
         self.evict_batch_size = evict_batch_size
         self.max_queue_wait_ms = max_queue_wait_ms
+        # idle_only waits for IDLE windows; use a slightly longer bypass so we do not
+        # force H2D during compute every ~30ms (roughly one PP micro-window).
+        if pp_phase_h2d_policy == "idle_only" and max_queue_wait_ms > 0:
+            self._starvation_wait_ms = max(max_queue_wait_ms, 100)
+        else:
+            self._starvation_wait_ms = max_queue_wait_ms
         self.adaptive_h2d_concurrency = adaptive_h2d_concurrency
         self.adaptive_h2d_high_load_threshold = adaptive_h2d_high_load_threshold
         self.adaptive_h2d_high_load_concurrency = adaptive_h2d_high_load_concurrency
@@ -191,25 +201,35 @@ class PCIeTransferScheduler:
         """Compute effective H2D limit based on PP phase and configured policy.
 
         Returns:
-            Effective max concurrent H2D based on current PP phase and policy:
-            - IDLE/FORWARD: Full concurrency (base_max_concurrent_h2d)
-            - RECV/SEND with "soft" policy: Allow 1 concurrent H2D
-            - RECV/SEND with "hard" policy: Block all H2D (return 0)
-            - RECV/SEND with "restore_only" policy: Allow 1 if Restore pending, else 0
+            Effective max concurrent H2D. IDLE allows full base concurrency when
+            phase-aware scheduling is on. FORWARD limits H2D to avoid memory bandwidth
+            contention with model compute. RECV/SEND follow soft/hard/restore_only.
         """
         base_limit = self._get_dynamic_max_h2d()
         if not self.enable_pp_phase_aware:
             return base_limit
-        if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
+
+        policy = self.pp_phase_h2d_policy
+
+        if policy == "idle_only":
+            return base_limit if self._pp_phase == PPPhase.IDLE else 0
+
+        if self._pp_phase == PPPhase.IDLE:
             return base_limit
 
-        # PP communication phase (RECV/SEND) - apply policy
-        if self.pp_phase_h2d_policy == "hard":
-            return 0
-        elif self.pp_phase_h2d_policy == "restore_only":
-            return 1 if self._has_pending_restore() else 0
-        else:  # "soft" (default)
+        if self._pp_phase == PPPhase.FORWARD:
+            if policy == "hard":
+                return 0
+            if policy == "restore_only":
+                return 1 if self._has_pending_restore() else 0
             return min(1, base_limit)
+
+        # RECV/SEND
+        if policy == "hard":
+            return 0
+        if policy == "restore_only":
+            return 1 if self._has_pending_restore() else 0
+        return min(1, base_limit)
 
     def submit_transfer(
         self,
@@ -375,11 +395,11 @@ class PCIeTransferScheduler:
         if (
             self._dispatch_fn is None
             or not self._pending_h2d
-            or self.max_queue_wait_ms <= 0
+            or self._starvation_wait_ms <= 0
         ):
             return False
 
-        threshold_sec = self.max_queue_wait_ms / 1000.0
+        threshold_sec = self._starvation_wait_ms / 1000.0
         now = time.monotonic()
 
         items: list[tuple[int, int, TransferRequest]] = []
@@ -432,9 +452,11 @@ class PCIeTransferScheduler:
 
         Strategy:
         1. D2H (Evict) - dispatch anytime, Evict-first to free blocks early
-        2. H2D - soft phase limit (IDLE/FORWARD: full concurrency; RECV/SEND: 1)
-        3. H2D-D2H conflict avoidance - reduce H2D concurrency when D2H is active
-        4. Starved Prefetch - bypass phase cap after max_queue_wait_ms
+        2. H2D - phase limit (idle_only: IDLE only; soft: FORWARD/RECV/SEND capped)
+        3. Starved Prefetch - bypass phase cap after starvation wait threshold
+
+        Note: Phase 2 H2D-D2H conflict avoidance logic removed (2026-03-27)
+        due to <5% actual overlap and causing 100% prefetch starvation.
         """
         if not self._pending_h2d and not self._pending_d2h:
             return False
@@ -446,12 +468,11 @@ class PCIeTransferScheduler:
         # D2H (Evict) first - frees blocks before H2D consumes them
         evict_dispatched = self._flush_d2h()
 
-        # Reduce H2D concurrency if there are active D2H transfers to avoid PCIe conflict
-        effective = self._effective_max_h2d_for_phase()
-        if self._active_d2h_count > 0:
-            effective_h2d = max(0, effective - self._active_d2h_count)
-        else:
-            effective_h2d = effective
+        # Phase 2 logic removed: H2D-D2H conflict avoidance was overly conservative
+        # Observation: H2D-D2H overlap rate is <5%, aggressive limiting caused
+        # 100% prefetch starvation (all forced via max_queue_wait_ms bypass)
+        # resulting in catastrophic P95/P99 TTFT degradation (+1600%)
+        effective_h2d = self._effective_max_h2d_for_phase()
 
         h2d_dispatched = self._flush_h2d_transfers(effective_max=effective_h2d)
         h2d_dispatched |= self._flush_starved_prefetches()
@@ -491,7 +512,7 @@ class PCIeTransferScheduler:
         """Handle PP phase changes.
 
         - RECV/SEND: Only dispatch D2H (Evict)
-        - FORWARD: Evict + H2D with soft limits (full concurrency vs RECV/SEND)
+        - FORWARD: Evict only (avoid H2D during GPU forward; H2D via flush() elsewhere)
         - IDLE: Reset H2D count, flush all (D2H + H2D)
         """
         if new_phase != self._pp_phase:
@@ -504,8 +525,9 @@ class PCIeTransferScheduler:
             self._flush_d2h()
 
         elif new_phase == PPPhase.FORWARD:
-            if self._pending_h2d or self._pending_d2h:
-                self.flush()
+            # Do not call flush(): it would start H2D during model forward.
+            if self._pending_d2h:
+                self._flush_d2h()
 
         elif new_phase == PPPhase.IDLE:
             self._active_h2d_count = 0
