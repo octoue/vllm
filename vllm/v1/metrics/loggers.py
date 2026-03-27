@@ -1305,13 +1305,19 @@ class StatLoggerManager:
     ):
         if engine_idx is None:
             engine_idx = 0
-        for logger in self.stat_loggers:
-            logger.record(
-                scheduler_stats,
-                iteration_stats,
-                mm_cache_stats=mm_cache_stats,
-                engine_idx=engine_idx,
-            )
+        for stat_logger in self.stat_loggers:
+            try:
+                stat_logger.record(
+                    scheduler_stats,
+                    iteration_stats,
+                    mm_cache_stats=mm_cache_stats,
+                    engine_idx=engine_idx,
+                )
+            except Exception:
+                logger.exception(
+                    "Stat logger %s failed to record metrics; ignoring.",
+                    type(stat_logger).__name__,
+                )
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         for logger in self.stat_loggers:

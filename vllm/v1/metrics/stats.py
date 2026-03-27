@@ -268,16 +268,29 @@ class PromptTokenStats:
         prompt_len: int,
     ) -> None:
         """Update stats from a prefill output."""
+        prompt_len = max(0, prompt_len)
+        if prompt_len == 0:
+            return
+
+        # Sanitize counts: e.g. transient -1 sentinel, or connector/block
+        # invalidation leaving num_external_computed_tokens out of sync with
+        # num_cached_tokens. Without this, local_cache_hit can go negative and
+        # Prometheus counters reject the increment.
+        num_cached_tokens = max(0, min(num_cached_tokens, prompt_len))
+        num_external_computed_tokens = max(0, num_external_computed_tokens)
+
         # When all tokens are cached, the scheduler reduces num_cached_tokens
         # by 1 to force the model to recompute the last token, since the model
         # needs at least one input token to run a forward pass.
         recomputed = 1 if (num_cached_tokens + 1 == prompt_len) else 0
 
+        # Cap external attribution so local_cache_hit stays >= 0 while
+        # preserving: computed + local_cache_hit + external - recomputed = total.
+        ext_eff = min(num_external_computed_tokens, num_cached_tokens + recomputed)
+
         self.computed += prompt_len - num_cached_tokens
-        self.external_kv_transfer += num_external_computed_tokens
-        self.local_cache_hit += (
-            num_cached_tokens + recomputed - num_external_computed_tokens
-        )
+        self.external_kv_transfer += ext_eff
+        self.local_cache_hit += num_cached_tokens + recomputed - ext_eff
         self.cached_tokens += num_cached_tokens
         self.recomputed_tokens += recomputed
         self.total += prompt_len
