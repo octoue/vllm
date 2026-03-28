@@ -218,6 +218,104 @@ def test_pp_phase_recv_no_flush():
     assert sched.has_pending_transfers is True
 
 
+def test_flush_evict_and_restore_dispatches_prefetch_in_idle():
+    """flush_evict_and_restore() dispatches Prefetch when PP phase is IDLE."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    # IDLE is the default phase
+    assert sched._pp_phase == PPPhase.IDLE
+
+    sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch")
+    sched.flush_evict_and_restore()
+
+    assert "Evict" in dispatched
+    assert "Restore" in dispatched
+    assert "Prefetch" in dispatched
+    assert len(dispatched) == 3
+
+
+def test_flush_evict_and_restore_dispatches_prefetch_in_forward():
+    """flush_evict_and_restore() dispatches Prefetch when PP phase is FORWARD."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.on_pp_phase_change(PPPhase.FORWARD)
+
+    sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch")
+    sched.flush_evict_and_restore()
+
+    assert "Evict" in dispatched
+    assert "Prefetch" in dispatched
+
+
+def test_flush_evict_and_restore_no_prefetch_in_recv():
+    """flush_evict_and_restore() does NOT dispatch Prefetch when PP phase is RECV."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.on_pp_phase_change(PPPhase.RECV)
+
+    sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch")
+    sched.flush_evict_and_restore()
+
+    assert "Evict" in dispatched
+    assert "Restore" in dispatched
+    assert "Prefetch" not in dispatched
+    assert sched.has_pending_transfers is True
+
+
+def test_flush_evict_and_restore_no_prefetch_in_send():
+    """flush_evict_and_restore() does NOT dispatch Prefetch when PP phase is SEND."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.on_pp_phase_change(PPPhase.SEND)
+
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch")
+    sched.flush_evict_and_restore()
+
+    assert "Prefetch" not in dispatched
+    assert sched.has_pending_transfers is True
+
+
 def test_dispatch_fn_false_requeues():
     """When dispatch_fn returns False, request is requeued."""
     call_count = 0

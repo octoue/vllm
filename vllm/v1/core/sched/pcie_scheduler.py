@@ -248,10 +248,13 @@ class PCIeTransferScheduler:
         return dispatched
 
     def flush_evict_and_restore(self) -> bool:
-        """Dispatch Evict + Restore immediately. Prefetch stays queued for PP idle."""
+        """Dispatch Evict + Restore immediately. Prefetch if in IDLE/FORWARD."""
         d2h_ok = self._flush_d2h()
         restore_ok = self._flush_restore_only()
-        return d2h_ok or restore_ok
+        prefetch_ok = False
+        if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
+            prefetch_ok = self._flush_h2d_transfers()
+        return d2h_ok or restore_ok or prefetch_ok
 
     def _flush_h2d_transfers(self, effective_max: int | None = None) -> bool:
         """Dispatch H2D (Prefetch/Restore) transfers.
