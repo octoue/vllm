@@ -162,6 +162,17 @@ class SchedulerConfig:
     evict_batch_size: int = Field(default=4, ge=1)
     """Reserved for Evict batch aggregation (PCIe scheduling only)."""
 
+    max_h2d_per_idle_window: int = Field(default=3, ge=0)
+    """Max H2D transfers dispatched per PP IDLE window (PCIe scheduling only).
+    Prevents overloading a single IDLE window with too many transfers.
+    0 = unlimited (no per-window limit)."""
+
+    idle_window_budget_ms: float = Field(default=7.0, ge=0.0)
+    """Time budget per PP IDLE window in milliseconds (PCIe scheduling only).
+    Stops dispatching H2D when elapsed time exceeds this budget.
+    Should be slightly less than actual IDLE window duration (~8.5ms).
+    0 = unlimited (no time budget)."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

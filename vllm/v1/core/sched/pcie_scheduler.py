@@ -85,6 +85,8 @@ class PCIeTransferScheduler:
         enable_pp_phase_aware: bool = True,
         evict_batch_size: int = 4,
         max_queue_wait_ms: int = 30,
+        max_h2d_per_idle_window: int = 3,
+        idle_window_budget_ms: float = 7.0,
         dispatch_fn: Callable[[TransferRequest], bool] | None = None,
     ):
         """Initialize the PCIe transfer scheduler.
@@ -95,6 +97,8 @@ class PCIeTransferScheduler:
             enable_pp_phase_aware: Whether to align H2D with PP idle windows.
             evict_batch_size: Batch size for Evict operations (reserved for future).
             max_queue_wait_ms: Prefetch queue wait before bypassing phase limits (0=off).
+            max_h2d_per_idle_window: Max H2D dispatches per IDLE window (0=unlimited).
+            idle_window_budget_ms: Time budget per IDLE window in ms (0=unlimited).
             dispatch_fn: Callback to execute a transfer; receives (spec, label).
         """
         self.max_concurrent_h2d = max_concurrent_h2d
@@ -102,12 +106,21 @@ class PCIeTransferScheduler:
         self.enable_pp_phase_aware = enable_pp_phase_aware
         self.evict_batch_size = evict_batch_size
         self.max_queue_wait_ms = max_queue_wait_ms
+        self.max_h2d_per_idle_window = max_h2d_per_idle_window
+        self.idle_window_budget_ms = idle_window_budget_ms
         self._dispatch_fn = dispatch_fn
         self._pending_h2d: list[tuple[int, int, TransferRequest]] = []  # Restore/Prefetch, min-heap
         self._pending_d2h: list[TransferRequest] = []  # Evict, FIFO
         self._sequence_counter = 0
         self._active_h2d_count = 0
         self._pp_phase = PPPhase.IDLE
+
+        # Phase 1: Idle window capacity tracking
+        self._idle_window_h2d_count = 0  # H2D dispatched in current IDLE window
+        self._idle_window_start_time = 0.0  # When current IDLE window started
+        # Rolling window utilization for adaptive tuning
+        self._idle_window_utilizations: list[float] = []  # Recent utilization ratios
+        self._idle_window_max_history = 20  # Rolling window size
 
         # Per-phase H2D latency tracking (dispatch → completion)
         self._phase_latency: dict[str, list[float]] = defaultdict(list)
@@ -123,6 +136,9 @@ class PCIeTransferScheduler:
             "total_submitted": 0,        # Total transfers submitted
             "pp_idle_flushes": 0,        # Number of flushes triggered by PP idle phase
             "prefetch_starved_dispatched": 0,  # Prefetch forced out after max_queue_wait_ms
+            "restore_fastpath_dispatched": 0,  # Phase 3: Restore dispatched via fast-path
+            "idle_window_budget_exhausted": 0,  # Phase 1: IDLE windows hitting budget limit
+            "idle_window_count_exhausted": 0,   # Phase 1: IDLE windows hitting count limit
         }
 
     def should_defer_prefetch(self, free_blocks: int) -> bool:
@@ -149,6 +165,41 @@ class PCIeTransferScheduler:
         if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
             return self.max_concurrent_h2d
         return min(1, self.max_concurrent_h2d)
+
+    def _idle_window_has_budget(self) -> bool:
+        """Check if current IDLE window has remaining capacity (Phase 1).
+
+        Returns True if:
+        - Not in IDLE phase (limits only apply to IDLE windows)
+        - IDLE window count/budget limits are disabled (value=0)
+        - Both count and time budget have remaining capacity
+        """
+        if self._pp_phase != PPPhase.IDLE:
+            return True
+
+        # Check count limit
+        if (self.max_h2d_per_idle_window > 0
+                and self._idle_window_h2d_count >= self.max_h2d_per_idle_window):
+            self._stats["idle_window_count_exhausted"] += 1
+            return False
+
+        # Check time budget
+        if self.idle_window_budget_ms > 0 and self._idle_window_start_time > 0:
+            elapsed_ms = (time.monotonic() - self._idle_window_start_time) * 1000.0
+            if elapsed_ms >= self.idle_window_budget_ms:
+                self._stats["idle_window_budget_exhausted"] += 1
+                return False
+
+        return True
+
+    def _record_idle_window_utilization(self) -> None:
+        """Record utilization of the ending IDLE window for adaptive tuning."""
+        if self._idle_window_start_time <= 0 or self.max_h2d_per_idle_window <= 0:
+            return
+        utilization = self._idle_window_h2d_count / self.max_h2d_per_idle_window
+        self._idle_window_utilizations.append(utilization)
+        if len(self._idle_window_utilizations) > self._idle_window_max_history:
+            self._idle_window_utilizations.pop(0)
 
     def submit_transfer(
         self,
@@ -266,11 +317,52 @@ class PCIeTransferScheduler:
             prefetch_ok = self._flush_h2d_transfers()
         return d2h_ok or restore_ok or prefetch_ok
 
+    def _flush_restore_fastpath(self) -> bool:
+        """Phase 3: Dispatch Restore transfers immediately, bypassing phase limits.
+
+        Restore is on the critical path (user request waiting for TTFT), so it
+        should never be delayed by phase-aware scheduling. Only concurrency
+        limit (max_concurrent_h2d) is respected.
+        """
+        if self._dispatch_fn is None or not self._pending_h2d:
+            return False
+
+        dispatched = False
+        to_push_back: list[tuple[int, int, TransferRequest]] = []
+        while self._pending_h2d:
+            pri, seq, req = heapq.heappop(self._pending_h2d)
+            if req.label != "Restore":
+                to_push_back.append((pri, seq, req))
+                continue
+            if self._active_h2d_count >= self.max_concurrent_h2d:
+                to_push_back.append((pri, seq, req))
+                break
+            req.dispatch_phase = self._pp_phase.name
+            req.dispatch_time = time.monotonic()
+            self._active_h2d_count += 1
+            success = self._dispatch_fn(req)
+            if success:
+                dispatched = True
+                self._stats["restore_dispatched"] += 1
+                self._stats["restore_fastpath_dispatched"] += 1
+                # Restore counts toward IDLE window budget but does NOT
+                # get blocked by it (it's a fast-path).
+                if self._pp_phase == PPPhase.IDLE:
+                    self._idle_window_h2d_count += 1
+            else:
+                self._active_h2d_count -= 1
+                to_push_back.append((pri, seq, req))
+                break
+        for item in to_push_back:
+            heapq.heappush(self._pending_h2d, item)
+        return dispatched
+
     def _flush_h2d_transfers(self, effective_max: int | None = None) -> bool:
         """Dispatch H2D (Prefetch/Restore) transfers.
 
         Respects effective_max concurrent active H2D (defaults to max_concurrent_h2d).
         Restore (priority 0) before Prefetch (1).
+        Phase 1: Also respects IDLE window capacity limits.
         """
         if self._dispatch_fn is None or not self._pending_h2d:
             return False
@@ -286,6 +378,10 @@ class PCIeTransferScheduler:
                 self._stats["h2d_throttled"] += 1
                 break
 
+            # Phase 1: Check IDLE window budget before dispatching
+            if not self._idle_window_has_budget():
+                break
+
             _, _, req = heapq.heappop(self._pending_h2d)
             req.dispatch_phase = self._pp_phase.name
             req.dispatch_time = time.monotonic()
@@ -298,6 +394,9 @@ class PCIeTransferScheduler:
                     self._stats["restore_dispatched"] += 1
                 elif req.label == "Prefetch":
                     self._stats["prefetch_dispatched"] += 1
+                # Phase 1: Track IDLE window H2D count
+                if self._pp_phase == PPPhase.IDLE:
+                    self._idle_window_h2d_count += 1
             else:
                 self._active_h2d_count -= 1
                 heapq.heappush(self._pending_h2d, (req.priority, req._sequence, req))
@@ -365,8 +464,10 @@ class PCIeTransferScheduler:
 
         Strategy:
         1. D2H (Evict) - dispatch anytime, Evict-first to free blocks early
-        2. H2D - soft phase limit (IDLE/FORWARD: full concurrency; RECV/SEND: 1)
-        3. Starved Prefetch - bypass phase cap after max_queue_wait_ms
+        2. Restore fast-path - dispatch immediately regardless of PP phase (Phase 3)
+        3. Prefetch H2D - soft phase limit (IDLE/FORWARD: full; RECV/SEND: 1)
+           + IDLE window budget (Phase 1)
+        4. Starved Prefetch - bypass phase cap after max_queue_wait_ms
         """
         if not self._pending_h2d and not self._pending_d2h:
             return False
@@ -378,17 +479,22 @@ class PCIeTransferScheduler:
         # D2H (Evict) first - frees blocks before H2D consumes them
         evict_dispatched = self._flush_d2h()
 
+        # Phase 3: Restore fast-path - bypasses phase limits
+        restore_dispatched = self._flush_restore_fastpath()
+
+        # Prefetch (and any remaining Restore) with phase + window limits
         effective = self._effective_max_h2d_for_phase()
         h2d_dispatched = self._flush_h2d_transfers(effective_max=effective)
         h2d_dispatched |= self._flush_starved_prefetches()
 
-        if not h2d_dispatched and self._pending_h2d:
+        if not (restore_dispatched or h2d_dispatched) and self._pending_h2d:
             logger.debug(
                 f"Flush: phase={self._pp_phase.name}, effective_h2d_cap={effective}, "
+                f"idle_window_h2d={self._idle_window_h2d_count}, "
                 f"H2D={len(self._pending_h2d)}, D2H={len(self._pending_d2h)}"
             )
 
-        return evict_dispatched or h2d_dispatched
+        return evict_dispatched or restore_dispatched or h2d_dispatched
 
     def on_transfer_completed(
         self,
@@ -410,18 +516,25 @@ class PCIeTransferScheduler:
     def on_pp_phase_change(self, new_phase: PPPhase) -> None:
         """Handle PP phase changes.
 
-        - RECV/SEND: Only dispatch D2H (Evict)
+        - RECV/SEND: Only dispatch D2H (Evict) + Restore fast-path (Phase 3)
         - FORWARD: Evict + H2D with soft limits (full concurrency vs RECV/SEND)
-        - IDLE: Reset H2D count, flush all (D2H + H2D)
+        - IDLE: Reset H2D count + window budget, flush all (D2H + H2D)
         """
         if new_phase != self._pp_phase:
             logger.debug(f"PP Phase: {self._pp_phase.name} → {new_phase.name}, "
                          f"H2D={len(self._pending_h2d)}, D2H={len(self._pending_d2h)}")
 
+        # Phase 1: Record utilization of ending IDLE window
+        if self._pp_phase == PPPhase.IDLE and new_phase != PPPhase.IDLE:
+            self._record_idle_window_utilization()
+
         self._pp_phase = new_phase
 
         if new_phase == PPPhase.RECV or new_phase == PPPhase.SEND:
             self._flush_d2h()
+            # Phase 3: Restore fast-path even during RECV/SEND
+            if self._pending_h2d:
+                self._flush_restore_fastpath()
 
         elif new_phase == PPPhase.FORWARD:
             if self._pending_h2d or self._pending_d2h:
@@ -429,6 +542,9 @@ class PCIeTransferScheduler:
 
         elif new_phase == PPPhase.IDLE:
             self._active_h2d_count = 0
+            # Phase 1: Reset IDLE window counters
+            self._idle_window_h2d_count = 0
+            self._idle_window_start_time = time.monotonic()
             if self._pending_h2d or self._pending_d2h:
                 self._stats["pp_idle_flushes"] += 1
                 self.flush()
@@ -446,18 +562,33 @@ class PCIeTransferScheduler:
         """Log current statistics for debugging and analysis."""
         logger.info(
             "PCIe Scheduler Stats: submitted=%d, deferred=%d, "
-            "restore=%d, prefetch=%d, evict=%d, max_queue=%d, "
-            "throttled=%d, pp_idle_flushes=%d, prefetch_starved=%d",
+            "restore=%d (fastpath=%d), prefetch=%d, evict=%d, max_queue=%d, "
+            "throttled=%d, pp_idle_flushes=%d, prefetch_starved=%d, "
+            "idle_budget_exhausted=%d, idle_count_exhausted=%d",
             self._stats["total_submitted"],
             self._stats["prefetch_deferred"],
             self._stats["restore_dispatched"],
+            self._stats["restore_fastpath_dispatched"],
             self._stats["prefetch_dispatched"],
             self._stats["evict_dispatched"],
             self._stats["max_queue_depth"],
             self._stats["h2d_throttled"],
             self._stats["pp_idle_flushes"],
             self._stats["prefetch_starved_dispatched"],
+            self._stats["idle_window_budget_exhausted"],
+            self._stats["idle_window_count_exhausted"],
         )
+        # Log IDLE window utilization summary
+        if self._idle_window_utilizations:
+            arr = np.array(self._idle_window_utilizations)
+            logger.info(
+                "IDLE Window Utilization: n=%d, mean=%.2f, "
+                "P50=%.2f, P95=%.2f, max=%.2f",
+                len(arr), float(np.mean(arr)),
+                float(np.percentile(arr, 50)),
+                float(np.percentile(arr, 95)),
+                float(np.max(arr)),
+            )
         # Per-phase H2D latency summary
         for phase, latencies in sorted(self._phase_latency.items()):
             if not latencies:

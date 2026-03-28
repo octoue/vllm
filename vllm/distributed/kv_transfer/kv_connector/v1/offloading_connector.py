@@ -661,6 +661,8 @@ class OffloadingConnectorWorker:
                 enable_pp_phase_aware=sc.enable_pp_phase_aware,
                 evict_batch_size=sc.evict_batch_size,
                 max_queue_wait_ms=sc.max_queue_wait_ms,
+                max_h2d_per_idle_window=sc.max_h2d_per_idle_window,
+                idle_window_budget_ms=sc.idle_window_budget_ms,
                 dispatch_fn=self._dispatch_pcie_transfer,
             )
 

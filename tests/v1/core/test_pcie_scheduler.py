@@ -447,6 +447,243 @@ def test_offloading_connector_creates_pcie_scheduler_when_enabled():
     assert isinstance(conn._pcie_scheduler, PCIeTransferScheduler)
 
 
+# ------------------------------------------------------------------
+# Phase 1: Idle window capacity awareness
+# ------------------------------------------------------------------
+
+
+def test_idle_window_count_limit():
+    """max_h2d_per_idle_window limits H2D dispatches within a single IDLE window."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=2,
+        idle_window_budget_ms=0,  # disable time budget
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    # Default phase is IDLE
+    assert sched._pp_phase == PPPhase.IDLE
+    sched._idle_window_start_time = time.monotonic()
+
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="a")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="b")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="c")
+    sched.flush()
+
+    # Only 2 dispatched due to window count limit
+    assert len(dispatched) == 2
+    assert sched.has_pending_transfers is True
+    assert sched._idle_window_h2d_count == 2
+
+    # New IDLE window resets counter
+    sched.on_pp_phase_change(PPPhase.RECV)
+    sched.on_pp_phase_change(PPPhase.IDLE)
+    assert sched._idle_window_h2d_count == 1  # third was dispatched in new window
+    assert len(dispatched) == 3
+
+
+def test_idle_window_budget_limit():
+    """idle_window_budget_ms stops dispatching when time budget is exhausted."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=0,  # disable count limit
+        idle_window_budget_ms=5.0,  # 5ms budget
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    # Simulate IDLE window that started 10ms ago (budget exhausted)
+    sched._idle_window_start_time = time.monotonic() - 0.010
+
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="a")
+    sched.flush()
+
+    # Budget exhausted, nothing dispatched
+    assert len(dispatched) == 0
+    assert sched.has_pending_transfers is True
+    assert sched._stats["idle_window_budget_exhausted"] >= 1
+
+
+def test_idle_window_limit_not_applied_in_forward():
+    """IDLE window limits only apply in IDLE phase, not FORWARD."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=1,
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.on_pp_phase_change(PPPhase.FORWARD)
+
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="a")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="b")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="c")
+    sched.flush()
+
+    # All dispatched because we're in FORWARD, not IDLE
+    assert len(dispatched) == 3
+
+
+# ------------------------------------------------------------------
+# Phase 3: Restore fast-path
+# ------------------------------------------------------------------
+
+
+def test_restore_fastpath_dispatches_in_recv():
+    """Restore is dispatched even in RECV phase via fast-path."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=2,
+        enable_pp_phase_aware=True,
+        max_queue_wait_ms=0,  # disable starvation bypass
+        dispatch_fn=capture_dispatch,
+    )
+    sched.on_pp_phase_change(PPPhase.RECV)
+
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="p1")
+    sched.flush()
+
+    # Restore dispatched via fast-path; Prefetch blocked by RECV
+    assert "Restore" in dispatched
+    assert "Prefetch" not in dispatched
+    assert sched._stats["restore_fastpath_dispatched"] == 1
+
+
+def test_restore_fastpath_dispatches_in_send():
+    """Restore is dispatched even in SEND phase via fast-path."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=2,
+        enable_pp_phase_aware=True,
+        max_queue_wait_ms=0,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.on_pp_phase_change(PPPhase.SEND)
+
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="p1")
+    sched.flush()
+
+    assert "Restore" in dispatched
+    assert "Prefetch" not in dispatched
+
+
+def test_restore_fastpath_respects_concurrency_limit():
+    """Restore fast-path still respects max_concurrent_h2d."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.req_id or "")
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=1,
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.on_pp_phase_change(PPPhase.RECV)
+
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r2")
+    sched.flush()
+
+    # Only 1 dispatched due to concurrency limit
+    assert len(dispatched) == 1
+    assert dispatched[0] == "r1"
+    assert sched.has_pending_transfers is True
+
+
+def test_restore_fastpath_not_blocked_by_idle_window_budget():
+    """Restore bypasses IDLE window count limit (but still counted)."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=1,
+        idle_window_budget_ms=0,
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    sched._idle_window_start_time = time.monotonic()
+
+    # Submit 2 Restores + 1 Prefetch
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r2")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="p1")
+    sched.flush()
+
+    # Both Restores dispatched via fast-path (not blocked by window limit)
+    # Prefetch blocked because window count is already 2 > limit of 1
+    restore_count = sum(1 for d in dispatched if d == "Restore")
+    prefetch_count = sum(1 for d in dispatched if d == "Prefetch")
+    assert restore_count == 2
+    assert prefetch_count == 0
+    assert sched._idle_window_h2d_count == 2
+
+
+def test_phase_change_triggers_restore_fastpath_in_recv():
+    """on_pp_phase_change(RECV) dispatches pending Restore via fast-path."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=2,
+        enable_pp_phase_aware=True,
+        max_queue_wait_ms=0,
+        dispatch_fn=capture_dispatch,
+    )
+    # Submit while still in IDLE (initial)
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="p1")
+
+    # Transition to RECV - Restore should be dispatched
+    sched.on_pp_phase_change(PPPhase.RECV)
+
+    assert "Restore" in dispatched
+    # Prefetch not dispatched during RECV
+    prefetch_count = sum(1 for d in dispatched if d == "Prefetch")
+    assert prefetch_count == 0
+
+
+# ------------------------------------------------------------------
+# OffloadingConnectorWorker integration (mock-based)
+# ------------------------------------------------------------------
+
+
 def test_offloading_connector_no_pcie_scheduler_when_disabled():
     """When enable_pcie_scheduling=False, OffloadingConnectorWorker has no PCIe scheduler."""
     from unittest.mock import MagicMock
