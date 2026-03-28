@@ -155,9 +155,15 @@ class SchedulerConfig:
     enable_pp_phase_aware: bool = True
     """Align H2D transfers with PP pipeline idle windows (PCIe scheduling only)."""
 
-    max_queue_wait_ms: int = Field(default=30, ge=0)
+    max_queue_wait_ms: int = Field(default=15, ge=0)
     """Max time a Prefetch may wait in the PCIe scheduler queue before being
     dispatched regardless of PP phase (0 = disable starvation bypass)."""
+
+    restore_max_queue_wait_ms: int = Field(default=5, ge=0)
+    """Max time a Restore may wait in the PCIe scheduler queue before being
+    dispatched with full concurrency (bypasses phase soft cap). Shorter than
+    max_queue_wait_ms to give Restore priority. Only fires in IDLE/FORWARD
+    phases to avoid RECV/SEND PCIe contention. (0 = disable)."""
 
     evict_batch_size: int = Field(default=4, ge=1)
     """Reserved for Evict batch aggregation (PCIe scheduling only)."""
