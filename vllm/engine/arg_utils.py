@@ -1701,7 +1701,8 @@ class EngineArgs:
             enable_pcie_scheduling=self.enable_pcie_scheduling,
             max_concurrent_h2d=self.max_concurrent_h2d,
             prefetch_block_threshold=self.prefetch_block_threshold,
-            enable_pp_phase_aware=self.enable_pp_phase_aware,
+            enable_pp_phase_aware=(self.enable_pp_phase_aware
+                                   and envs.VLLM_PCIE_PP_PHASE_AWARE),
             max_queue_wait_ms=self.max_queue_wait_ms,
         )
 

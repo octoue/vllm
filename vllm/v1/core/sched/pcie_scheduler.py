@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import heapq
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable
+
+import numpy as np
 
 from vllm.logger import init_logger
 
@@ -57,6 +60,8 @@ class TransferRequest:
     submit_time: float = field(default_factory=time.monotonic)
     _sequence: int = field(default=0, repr=False)
     extra: dict[str, Any] = field(default_factory=dict)
+    dispatch_phase: str = ""
+    dispatch_time: float = 0.0
 
     def __lt__(self, other: TransferRequest) -> bool:
         # heapq is min-heap; lower priority value = higher priority
@@ -103,6 +108,9 @@ class PCIeTransferScheduler:
         self._sequence_counter = 0
         self._active_h2d_count = 0
         self._pp_phase = PPPhase.IDLE
+
+        # Per-phase H2D latency tracking (dispatch → completion)
+        self._phase_latency: dict[str, list[float]] = defaultdict(list)
 
         # Statistics for observability
         self._stats = {
@@ -234,6 +242,8 @@ class PCIeTransferScheduler:
             if self._active_h2d_count >= self.max_concurrent_h2d:
                 to_push_back.append((req.priority, req._sequence, req))
                 break
+            req.dispatch_phase = self._pp_phase.name
+            req.dispatch_time = time.monotonic()
             self._active_h2d_count += 1
             success = self._dispatch_fn(req)
             if success:
@@ -277,6 +287,8 @@ class PCIeTransferScheduler:
                 break
 
             _, _, req = heapq.heappop(self._pending_h2d)
+            req.dispatch_phase = self._pp_phase.name
+            req.dispatch_time = time.monotonic()
             self._active_h2d_count += 1
             success = self._dispatch_fn(req)
 
@@ -331,6 +343,8 @@ class PCIeTransferScheduler:
             if self._active_h2d_count >= self.max_concurrent_h2d:
                 rest.append(t)
                 continue
+            req.dispatch_phase = self._pp_phase.name
+            req.dispatch_time = time.monotonic()
             self._active_h2d_count += 1
             success = self._dispatch_fn(req)
             if success:
@@ -376,13 +390,22 @@ class PCIeTransferScheduler:
 
         return evict_dispatched or h2d_dispatched
 
-    def on_transfer_completed(self, label: str) -> None:
+    def on_transfer_completed(
+        self,
+        label: str,
+        dispatch_phase: str = "",
+        dispatch_time: float = 0.0,
+    ) -> None:
         """Notify that an H2D transfer has completed.
 
         Call from the offloading handler when a Prefetch or Restore finishes.
+        Records per-phase latency when dispatch_phase/dispatch_time are provided.
         """
         if label in ("Prefetch", "Restore") and self._active_h2d_count > 0:
             self._active_h2d_count -= 1
+        if dispatch_phase and dispatch_time > 0:
+            latency_ms = (time.monotonic() - dispatch_time) * 1000.0
+            self._phase_latency[dispatch_phase].append(latency_ms)
 
     def on_pp_phase_change(self, new_phase: PPPhase) -> None:
         """Handle PP phase changes.
@@ -435,3 +458,16 @@ class PCIeTransferScheduler:
             self._stats["pp_idle_flushes"],
             self._stats["prefetch_starved_dispatched"],
         )
+        # Per-phase H2D latency summary
+        for phase, latencies in sorted(self._phase_latency.items()):
+            if not latencies:
+                continue
+            arr = np.array(latencies)
+            logger.info(
+                "H2D Phase Latency [%s]: n=%d, mean=%.2fms, "
+                "P50=%.2fms, P95=%.2fms, P99=%.2fms",
+                phase, len(arr), float(np.mean(arr)),
+                float(np.percentile(arr, 50)),
+                float(np.percentile(arr, 95)),
+                float(np.percentile(arr, 99)),
+            )

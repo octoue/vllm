@@ -640,6 +640,7 @@ class OffloadingConnectorWorker:
         self._jobs: dict[int, tuple[ReqId, bool]] = {}
         # job_id -> label for H2D loads (Restore/Prefetch), used by on_transfer_completed
         self._load_job_label: dict[int, str] = {}
+        self._load_job_dispatch_info: dict[int, tuple[str, float]] = {}
         # req_id -> active job IDs
         self._load_job: dict[ReqId, int] = {}
         # req_id -> set(active job IDs)
@@ -686,6 +687,9 @@ class OffloadingConnectorWorker:
             self._jobs[job_id] = (req_id, False)
             self._load_job_label[job_id] = req.label
             self._load_job[req_id] = job_id
+            if req.dispatch_phase and req.dispatch_time > 0:
+                self._load_job_dispatch_info[job_id] = (
+                    req.dispatch_phase, req.dispatch_time)
             return self.worker.transfer_async(
                 job_id, req.transfer_spec, label=req.label
             )
@@ -823,7 +827,10 @@ class OffloadingConnectorWorker:
             req_id, store = self._jobs.pop(job_id)
             if self._pcie_scheduler is not None and not store:
                 label = self._load_job_label.pop(job_id, "Restore")
-                self._pcie_scheduler.on_transfer_completed(label)
+                dp_phase, dp_time = self._load_job_dispatch_info.pop(
+                    job_id, ("", 0.0))
+                self._pcie_scheduler.on_transfer_completed(
+                    label, dispatch_phase=dp_phase, dispatch_time=dp_time)
                 self._pcie_scheduler.flush()
             if (
                 transfer_result.transfer_time
