@@ -7,6 +7,7 @@ import time
 import pytest
 
 from vllm.v1.core.sched.pcie_scheduler import (
+    LoadLevel,
     PCIeTransferScheduler,
     PPPhase,
     TransferPriority,
@@ -541,12 +542,12 @@ def test_idle_window_limit_not_applied_in_forward():
 
 
 # ------------------------------------------------------------------
-# Constrained Restore priority (replaces Phase 3 fast-path)
+# Load-adaptive Phase-Aware scheduling
 # ------------------------------------------------------------------
 
 
-def test_restore_not_dispatched_in_recv_phase():
-    """Restore obeys phase discipline: NOT dispatched in RECV via flush()."""
+def test_load_level_low_strict_phase_aware():
+    """LOW load: RECV blocks H2D (strict Phase-Aware)."""
     dispatched: list[str] = []
 
     def capture_dispatch(req: TransferRequest) -> bool:
@@ -554,137 +555,169 @@ def test_restore_not_dispatched_in_recv_phase():
         return True
 
     sched = PCIeTransferScheduler(
-        max_concurrent_h2d=2,
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=3,
         enable_pp_phase_aware=True,
         max_queue_wait_ms=0,
-        restore_max_queue_wait_ms=0,  # disable starvation bypass
         dispatch_fn=capture_dispatch,
     )
     sched.on_pp_phase_change(PPPhase.RECV)
 
-    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
-    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="p1")
-    sched.flush()
-
-    # Neither dispatched in RECV (phase soft cap = 1, but both blocked by phase)
-    # Actually RECV allows at most 1 H2D, so Restore gets through
-    assert len([d for d in dispatched if d == "Restore"]) <= 1
-    # Prefetch should not be dispatched
-    assert "Prefetch" not in dispatched or len(dispatched) <= 1
-
-
-def test_restore_starved_dispatches_in_forward():
-    """Starved Restore dispatches in FORWARD phase after restore_max_queue_wait_ms."""
-    dispatched: list[str] = []
-
-    def capture_dispatch(req: TransferRequest) -> bool:
-        dispatched.append(req.label)
-        return True
-
-    sched = PCIeTransferScheduler(
-        max_concurrent_h2d=2,
-        enable_pp_phase_aware=True,
-        restore_max_queue_wait_ms=5,
-        max_queue_wait_ms=0,  # disable Prefetch starvation
-        dispatch_fn=capture_dispatch,
-    )
-    # Start in RECV to block dispatch
-    sched.on_pp_phase_change(PPPhase.RECV)
-    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
-
-    # Wait past restore_max_queue_wait_ms threshold
-    time.sleep(0.010)
-
-    # Move to FORWARD — starved Restore should fire
-    sched.on_pp_phase_change(PPPhase.FORWARD)
-
-    assert "Restore" in dispatched
-    assert sched._stats["restore_starved_dispatched"] >= 1
-
-
-def test_restore_starved_blocked_in_recv():
-    """Starved Restore does NOT dispatch in RECV phase (preserves phase discipline)."""
-    dispatched: list[str] = []
-
-    def capture_dispatch(req: TransferRequest) -> bool:
-        dispatched.append(req.label)
-        return True
-
-    sched = PCIeTransferScheduler(
-        max_concurrent_h2d=2,
-        enable_pp_phase_aware=True,
-        restore_max_queue_wait_ms=5,
-        max_queue_wait_ms=0,
-        dispatch_fn=capture_dispatch,
-    )
-    sched.on_pp_phase_change(PPPhase.RECV)
-    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
-
-    time.sleep(0.010)
-    # Still in RECV — starved Restore should NOT dispatch
-    sched.flush()
-
-    # Only the normal phase-limited dispatch (at most 1 in RECV)
-    assert sched._stats["restore_starved_dispatched"] == 0
-
-
-def test_restore_starved_dispatches_in_idle():
-    """Starved Restore dispatches in IDLE phase."""
-    dispatched: list[str] = []
-
-    def capture_dispatch(req: TransferRequest) -> bool:
-        dispatched.append(req.label)
-        return True
-
-    sched = PCIeTransferScheduler(
-        max_concurrent_h2d=1,
-        enable_pp_phase_aware=True,
-        restore_max_queue_wait_ms=5,
-        max_queue_wait_ms=0,
-        dispatch_fn=capture_dispatch,
-    )
-    # Fill concurrency to block normal dispatch
-    sched._active_h2d_count = 1
-
-    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
-    time.sleep(0.010)
-
-    # Reset active count and enter IDLE
-    sched.on_pp_phase_change(PPPhase.IDLE)
-
-    assert "Restore" in dispatched
-    assert sched._stats["restore_starved_dispatched"] >= 1
-
-
-def test_restore_wait_shorter_than_prefetch():
-    """Restore starvation fires faster than Prefetch (shorter wait threshold)."""
-    dispatched: list[str] = []
-
-    def capture_dispatch(req: TransferRequest) -> bool:
-        dispatched.append(req.label)
-        return True
-
-    sched = PCIeTransferScheduler(
-        max_concurrent_h2d=1,
-        enable_pp_phase_aware=True,
-        restore_max_queue_wait_ms=5,
-        max_queue_wait_ms=30,
-        dispatch_fn=capture_dispatch,
-    )
-    # Fill concurrency
-    sched._active_h2d_count = 1
-
+    # Submit 2 (≤ capacity of 3) → LOW load
     sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
     sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="p1")
 
-    # Wait past Restore threshold but not Prefetch threshold
-    time.sleep(0.010)
-    sched._active_h2d_count = 0
-    sched.on_pp_phase_change(PPPhase.IDLE)
+    assert sched._compute_load_level() == LoadLevel.LOW
+    sched.flush()
 
-    # Restore should be dispatched via starvation, Prefetch may or may not
-    assert "Restore" in dispatched
-    assert sched._stats["restore_starved_dispatched"] >= 1
+    # RECV at LOW: soft cap = 1, so at most 1 H2D dispatched
+    assert len(dispatched) <= 1
+
+
+def test_load_level_high_ignores_phase():
+    """HIGH load: RECV allows full H2D concurrency (G2-mode)."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=3,
+        enable_pp_phase_aware=True,
+        max_queue_wait_ms=0,
+        dispatch_fn=capture_dispatch,
+    )
+    sched.on_pp_phase_change(PPPhase.RECV)
+
+    # Submit 10 (> 3*3=9) → HIGH load
+    for i in range(10):
+        sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch",
+                              req_id=f"p{i}")
+
+    assert sched._compute_load_level() == LoadLevel.HIGH
+    sched.flush()
+
+    # HIGH: phase limits off, all dispatched up to max_concurrent_h2d
+    assert len(dispatched) == 10
+
+
+def test_load_level_medium_relaxes_idle_budget():
+    """MEDIUM load: IDLE window count limit is doubled."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=2,
+        idle_window_budget_ms=0,  # disable time budget
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    sched._idle_window_start_time = time.monotonic()
+
+    # Submit 5 (2 < 5 ≤ 6=2*3) → MEDIUM load
+    for i in range(5):
+        sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch",
+                              req_id=f"p{i}")
+
+    assert sched._compute_load_level() == LoadLevel.MEDIUM
+    sched.flush()
+
+    # MEDIUM doubles count: limit = 2*2 = 4, so 4 dispatched
+    assert len(dispatched) == 4
+    assert sched.has_pending_transfers is True
+
+
+def test_load_level_high_disables_idle_budget():
+    """HIGH load: IDLE window limits completely disabled."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=2,
+        idle_window_budget_ms=0,
+        enable_pp_phase_aware=True,
+        dispatch_fn=capture_dispatch,
+    )
+    sched._idle_window_start_time = time.monotonic()
+
+    # Submit 10 (> 2*3=6) → HIGH load
+    for i in range(10):
+        sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch",
+                              req_id=f"p{i}")
+
+    assert sched._compute_load_level() == LoadLevel.HIGH
+    sched.flush()
+
+    # HIGH: no window limits, all 10 dispatched
+    assert len(dispatched) == 10
+
+
+def test_load_level_transitions_tracked():
+    """Stats correctly count load level occurrences on each flush."""
+    def noop(req: TransferRequest) -> bool:
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=2,
+        enable_pp_phase_aware=True,
+        dispatch_fn=noop,
+    )
+
+    # LOW flush
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch")
+    sched.flush()
+    assert sched._stats["load_level_low"] == 1
+
+    # MEDIUM flush (submit 4 > 2, ≤ 6)
+    for _ in range(4):
+        sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch")
+    sched.flush()
+    assert sched._stats["load_level_medium"] == 1
+
+    # HIGH flush (submit 10 > 6)
+    for _ in range(10):
+        sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch")
+    sched.flush()
+    assert sched._stats["load_level_high"] == 1
+
+
+def test_high_load_recv_triggers_flush():
+    """on_pp_phase_change(RECV) flushes H2D when load is HIGH."""
+    dispatched: list[str] = []
+
+    def capture_dispatch(req: TransferRequest) -> bool:
+        dispatched.append(req.label)
+        return True
+
+    sched = PCIeTransferScheduler(
+        max_concurrent_h2d=10,
+        max_h2d_per_idle_window=2,
+        enable_pp_phase_aware=True,
+        max_queue_wait_ms=0,
+        dispatch_fn=capture_dispatch,
+    )
+
+    # Submit 10 items to reach HIGH load
+    for i in range(10):
+        sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch",
+                              req_id=f"p{i}")
+
+    # Transition to RECV — should flush because HIGH
+    sched.on_pp_phase_change(PPPhase.RECV)
+
+    assert len(dispatched) == 10
+    assert sched._stats["load_level_high"] >= 1
 
 
 # ------------------------------------------------------------------

@@ -49,6 +49,17 @@ class TransferPriority(IntEnum):
     """Lowest: Evict to CPU (D2H) - least latency critical."""
 
 
+class LoadLevel(IntEnum):
+    """Load level for adaptive Phase-Aware scheduling."""
+
+    LOW = 0
+    """Queue fits in one IDLE window → strict Phase-Aware + window limits."""
+    MEDIUM = 1
+    """Moderate backlog → relax window limits (2x count budget)."""
+    HIGH = 2
+    """Severe backlog → disable phase constraints (G2-mode)."""
+
+
 @dataclass
 class TransferRequest:
     """Encapsulates a transfer request for the PCIe scheduler."""
@@ -85,7 +96,6 @@ class PCIeTransferScheduler:
         enable_pp_phase_aware: bool = True,
         evict_batch_size: int = 4,
         max_queue_wait_ms: int = 30,
-        restore_max_queue_wait_ms: int = 5,
         max_h2d_per_idle_window: int = 3,
         idle_window_budget_ms: float = 7.0,
         dispatch_fn: Callable[[TransferRequest], bool] | None = None,
@@ -98,10 +108,8 @@ class PCIeTransferScheduler:
             enable_pp_phase_aware: Whether to align H2D with PP idle windows.
             evict_batch_size: Batch size for Evict operations (reserved for future).
             max_queue_wait_ms: Prefetch queue wait before bypassing phase limits (0=off).
-            restore_max_queue_wait_ms: Restore queue wait before bypassing phase limits.
-                Shorter than max_queue_wait_ms to give Restore priority without
-                breaking phase discipline. (0=off).
             max_h2d_per_idle_window: Max H2D dispatches per IDLE window (0=unlimited).
+                Also used as denominator for load-level computation.
             idle_window_budget_ms: Time budget per IDLE window in ms (0=unlimited).
             dispatch_fn: Callback to execute a transfer; receives (spec, label).
         """
@@ -110,7 +118,6 @@ class PCIeTransferScheduler:
         self.enable_pp_phase_aware = enable_pp_phase_aware
         self.evict_batch_size = evict_batch_size
         self.max_queue_wait_ms = max_queue_wait_ms
-        self.restore_max_queue_wait_ms = restore_max_queue_wait_ms
         self.max_h2d_per_idle_window = max_h2d_per_idle_window
         self.idle_window_budget_ms = idle_window_budget_ms
         self._dispatch_fn = dispatch_fn
@@ -120,30 +127,31 @@ class PCIeTransferScheduler:
         self._active_h2d_count = 0
         self._pp_phase = PPPhase.IDLE
 
-        # Phase 1: Idle window capacity tracking
+        # Idle window capacity tracking
         self._idle_window_h2d_count = 0  # H2D dispatched in current IDLE window
         self._idle_window_start_time = 0.0  # When current IDLE window started
-        # Rolling window utilization for adaptive tuning
-        self._idle_window_utilizations: list[float] = []  # Recent utilization ratios
-        self._idle_window_max_history = 20  # Rolling window size
+        self._idle_window_utilizations: list[float] = []  # Rolling utilization ratios
+        self._idle_window_max_history = 20
 
         # Per-phase H2D latency tracking (dispatch → completion)
         self._phase_latency: dict[str, list[float]] = defaultdict(list)
 
         # Statistics for observability
         self._stats = {
-            "prefetch_deferred": 0,      # Prefetch requests deferred due to block pressure
-            "restore_dispatched": 0,     # Restore transfers dispatched (high priority)
-            "prefetch_dispatched": 0,    # Prefetch transfers dispatched
-            "evict_dispatched": 0,       # Evict transfers dispatched (low priority)
-            "max_queue_depth": 0,        # Maximum pending transfer queue depth
-            "h2d_throttled": 0,          # H2D transfers throttled due to concurrency limit
-            "total_submitted": 0,        # Total transfers submitted
-            "pp_idle_flushes": 0,        # Number of flushes triggered by PP idle phase
-            "prefetch_starved_dispatched": 0,  # Prefetch forced out after max_queue_wait_ms
-            "restore_starved_dispatched": 0,   # Restore forced out after restore_max_queue_wait_ms
-            "idle_window_budget_exhausted": 0,  # Phase 1: IDLE windows hitting budget limit
-            "idle_window_count_exhausted": 0,   # Phase 1: IDLE windows hitting count limit
+            "prefetch_deferred": 0,
+            "restore_dispatched": 0,
+            "prefetch_dispatched": 0,
+            "evict_dispatched": 0,
+            "max_queue_depth": 0,
+            "h2d_throttled": 0,
+            "total_submitted": 0,
+            "pp_idle_flushes": 0,
+            "prefetch_starved_dispatched": 0,
+            "idle_window_budget_exhausted": 0,
+            "idle_window_count_exhausted": 0,
+            "load_level_low": 0,
+            "load_level_medium": 0,
+            "load_level_high": 0,
         }
 
     def should_defer_prefetch(self, free_blocks: int) -> bool:
@@ -163,32 +171,65 @@ class PCIeTransferScheduler:
             self._stats["prefetch_deferred"] += 1
         return should_defer
 
+    def _compute_load_level(self) -> LoadLevel:
+        """Compute current load level based on pending H2D queue depth.
+
+        Uses max_h2d_per_idle_window as capacity estimate for one window.
+        - LOW: pending fits in one window
+        - MEDIUM: needs a few windows
+        - HIGH: severely backlogged, disable phase constraints
+        """
+        pending = len(self._pending_h2d)
+        capacity = (
+            self.max_h2d_per_idle_window
+            if self.max_h2d_per_idle_window > 0
+            else self.max_concurrent_h2d
+        )
+        if pending <= capacity:
+            return LoadLevel.LOW
+        elif pending <= capacity * 3:
+            return LoadLevel.MEDIUM
+        return LoadLevel.HIGH
+
     def _effective_max_h2d_for_phase(self) -> int:
-        """Soft PP-phase limit: full concurrency in IDLE/FORWARD; at most 1 in RECV/SEND."""
+        """Load-adaptive PP-phase limit.
+
+        - LOW/MEDIUM: full concurrency in IDLE/FORWARD; at most 1 in RECV/SEND
+        - HIGH: full concurrency in all phases (G2-mode, no phase restriction)
+        """
         if not self.enable_pp_phase_aware:
+            return self.max_concurrent_h2d
+        load = self._compute_load_level()
+        if load == LoadLevel.HIGH:
             return self.max_concurrent_h2d
         if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
             return self.max_concurrent_h2d
         return min(1, self.max_concurrent_h2d)
 
     def _idle_window_has_budget(self) -> bool:
-        """Check if current IDLE window has remaining capacity (Phase 1).
+        """Load-adaptive IDLE window capacity check.
 
-        Returns True if:
-        - Not in IDLE phase (limits only apply to IDLE windows)
-        - IDLE window count/budget limits are disabled (value=0)
-        - Both count and time budget have remaining capacity
+        - LOW: strict count + time budget limits
+        - MEDIUM: doubled count limit, same time budget
+        - HIGH: no limits (return True always)
         """
         if self._pp_phase != PPPhase.IDLE:
             return True
 
-        # Check count limit
-        if (self.max_h2d_per_idle_window > 0
-                and self._idle_window_h2d_count >= self.max_h2d_per_idle_window):
-            self._stats["idle_window_count_exhausted"] += 1
-            return False
+        load = self._compute_load_level()
+        if load == LoadLevel.HIGH:
+            return True
 
-        # Check time budget
+        # Count limit (doubled in MEDIUM)
+        if self.max_h2d_per_idle_window > 0:
+            effective_count_limit = self.max_h2d_per_idle_window
+            if load == LoadLevel.MEDIUM:
+                effective_count_limit *= 2
+            if self._idle_window_h2d_count >= effective_count_limit:
+                self._stats["idle_window_count_exhausted"] += 1
+                return False
+
+        # Time budget (same for LOW/MEDIUM)
         if self.idle_window_budget_ms > 0 and self._idle_window_start_time > 0:
             elapsed_ms = (time.monotonic() - self._idle_window_start_time) * 1000.0
             if elapsed_ms >= self.idle_window_budget_ms:
@@ -322,69 +363,6 @@ class PCIeTransferScheduler:
             prefetch_ok = self._flush_h2d_transfers()
         return d2h_ok or restore_ok or prefetch_ok
 
-    def _flush_starved_restores(self) -> bool:
-        """Dispatch Restore requests that exceeded restore_max_queue_wait_ms.
-
-        Unlike Prefetch starvation bypass, Restore starvation is only allowed
-        in IDLE and FORWARD phases to avoid RECV/SEND PCIe contention.
-        Uses full max_concurrent_h2d (bypasses phase soft cap).
-        """
-        if (
-            self._dispatch_fn is None
-            or not self._pending_h2d
-            or self.restore_max_queue_wait_ms <= 0
-        ):
-            return False
-
-        # Only allow starved Restore dispatch in IDLE/FORWARD
-        if self._pp_phase not in (PPPhase.IDLE, PPPhase.FORWARD):
-            return False
-
-        threshold_sec = self.restore_max_queue_wait_ms / 1000.0
-        now = time.monotonic()
-
-        items: list[tuple[int, int, TransferRequest]] = []
-        while self._pending_h2d:
-            items.append(heapq.heappop(self._pending_h2d))
-
-        starved: list[tuple[int, int, TransferRequest]] = []
-        rest: list[tuple[int, int, TransferRequest]] = []
-        for t in items:
-            req = t[2]
-            if (
-                req.label == "Restore"
-                and (now - req.submit_time) >= threshold_sec
-            ):
-                starved.append(t)
-            else:
-                rest.append(t)
-
-        starved.sort(key=lambda x: x[2].submit_time)
-        dispatched = False
-        for t in starved:
-            _pri, _seq, req = t
-            if self._active_h2d_count >= self.max_concurrent_h2d:
-                rest.append(t)
-                continue
-            req.dispatch_phase = self._pp_phase.name
-            req.dispatch_time = time.monotonic()
-            self._active_h2d_count += 1
-            success = self._dispatch_fn(req)
-            if success:
-                dispatched = True
-                self._stats["restore_dispatched"] += 1
-                self._stats["restore_starved_dispatched"] += 1
-                if self._pp_phase == PPPhase.IDLE:
-                    self._idle_window_h2d_count += 1
-            else:
-                self._active_h2d_count -= 1
-                rest.append(t)
-                break
-
-        for t in rest:
-            heapq.heappush(self._pending_h2d, t)
-        return dispatched
-
     def _flush_h2d_transfers(self, effective_max: int | None = None) -> bool:
         """Dispatch H2D (Prefetch/Restore) transfers.
 
@@ -488,15 +466,15 @@ class PCIeTransferScheduler:
         return dispatched
 
     def flush(self) -> bool:
-        """Dispatch pending transfers, considering PP phase and transfer type.
+        """Dispatch pending transfers with load-adaptive Phase-Aware scheduling.
 
         Strategy:
-        1. D2H (Evict) - dispatch anytime, Evict-first to free blocks early
-        2. H2D - soft phase limit (IDLE/FORWARD: full concurrency; RECV/SEND: 1)
-           + IDLE window budget (Phase 1)
-        3. Starved Restore - bypass phase soft cap after restore_max_queue_wait_ms
-           (only in IDLE/FORWARD, never RECV/SEND)
-        4. Starved Prefetch - bypass phase cap after max_queue_wait_ms
+        1. D2H (Evict) - dispatch anytime, Evict-first to free blocks
+        2. H2D - load-adaptive phase limit:
+           - LOW/MEDIUM: IDLE/FORWARD full concurrency, RECV/SEND at most 1
+             + IDLE window budget (strict in LOW, relaxed in MEDIUM)
+           - HIGH: no phase restriction, no window limits (G2-mode)
+        3. Starved Prefetch - bypass phase cap after max_queue_wait_ms
         """
         if not self._pending_h2d and not self._pending_d2h:
             return False
@@ -505,20 +483,28 @@ class PCIeTransferScheduler:
         if not self.enable_pp_phase_aware:
             return self._flush_pending_transfers()
 
+        # Track load level for observability
+        load = self._compute_load_level()
+        if load == LoadLevel.LOW:
+            self._stats["load_level_low"] += 1
+        elif load == LoadLevel.MEDIUM:
+            self._stats["load_level_medium"] += 1
+        else:
+            self._stats["load_level_high"] += 1
+
         # D2H (Evict) first - frees blocks before H2D consumes them
         evict_dispatched = self._flush_d2h()
 
-        # H2D with phase + window limits (Restore before Prefetch by priority)
+        # H2D with load-adaptive phase + window limits
         effective = self._effective_max_h2d_for_phase()
         h2d_dispatched = self._flush_h2d_transfers(effective_max=effective)
-        # Starved Restore: shorter wait, only IDLE/FORWARD
-        h2d_dispatched |= self._flush_starved_restores()
-        # Starved Prefetch: longer wait, any phase
+        # Starved Prefetch safety valve
         h2d_dispatched |= self._flush_starved_prefetches()
 
         if not h2d_dispatched and self._pending_h2d:
             logger.debug(
-                f"Flush: phase={self._pp_phase.name}, effective_h2d_cap={effective}, "
+                f"Flush: phase={self._pp_phase.name}, load={load.name}, "
+                f"effective_h2d_cap={effective}, "
                 f"idle_window_h2d={self._idle_window_h2d_count}, "
                 f"H2D={len(self._pending_h2d)}, D2H={len(self._pending_d2h)}"
             )
@@ -543,17 +529,18 @@ class PCIeTransferScheduler:
             self._phase_latency[dispatch_phase].append(latency_ms)
 
     def on_pp_phase_change(self, new_phase: PPPhase) -> None:
-        """Handle PP phase changes.
+        """Handle PP phase changes with load-adaptive behavior.
 
-        - RECV/SEND: Only dispatch D2H (Evict); H2D held back
-        - FORWARD: Evict + H2D with soft limits (full concurrency)
-        - IDLE: Reset H2D count + window budget, flush all (D2H + H2D)
+        - RECV/SEND at LOW/MEDIUM: Only dispatch D2H (Evict); H2D held back
+        - RECV/SEND at HIGH: Full flush (phase limits disabled in G2-mode)
+        - FORWARD: Evict + H2D with soft limits
+        - IDLE: Reset H2D count + window budget, flush all
         """
         if new_phase != self._pp_phase:
             logger.debug(f"PP Phase: {self._pp_phase.name} → {new_phase.name}, "
                          f"H2D={len(self._pending_h2d)}, D2H={len(self._pending_d2h)}")
 
-        # Phase 1: Record utilization of ending IDLE window
+        # Record utilization of ending IDLE window
         if self._pp_phase == PPPhase.IDLE and new_phase != PPPhase.IDLE:
             self._record_idle_window_utilization()
 
@@ -561,6 +548,10 @@ class PCIeTransferScheduler:
 
         if new_phase == PPPhase.RECV or new_phase == PPPhase.SEND:
             self._flush_d2h()
+            # HIGH load: phase constraints are off, flush H2D too
+            if (self._pending_h2d
+                    and self._compute_load_level() == LoadLevel.HIGH):
+                self.flush()
 
         elif new_phase == PPPhase.FORWARD:
             if self._pending_h2d or self._pending_d2h:
@@ -568,7 +559,6 @@ class PCIeTransferScheduler:
 
         elif new_phase == PPPhase.IDLE:
             self._active_h2d_count = 0
-            # Phase 1: Reset IDLE window counters
             self._idle_window_h2d_count = 0
             self._idle_window_start_time = time.monotonic()
             if self._pending_h2d or self._pending_d2h:
@@ -588,14 +578,13 @@ class PCIeTransferScheduler:
         """Log current statistics for debugging and analysis."""
         logger.info(
             "PCIe Scheduler Stats: submitted=%d, deferred=%d, "
-            "restore=%d (starved=%d), prefetch=%d (starved=%d), "
-            "evict=%d, max_queue=%d, "
+            "restore=%d, prefetch=%d (starved=%d), evict=%d, max_queue=%d, "
             "throttled=%d, pp_idle_flushes=%d, "
-            "idle_budget_exhausted=%d, idle_count_exhausted=%d",
+            "idle_budget_exhausted=%d, idle_count_exhausted=%d, "
+            "load_levels=[L=%d M=%d H=%d]",
             self._stats["total_submitted"],
             self._stats["prefetch_deferred"],
             self._stats["restore_dispatched"],
-            self._stats["restore_starved_dispatched"],
             self._stats["prefetch_dispatched"],
             self._stats["prefetch_starved_dispatched"],
             self._stats["evict_dispatched"],
@@ -604,6 +593,9 @@ class PCIeTransferScheduler:
             self._stats["pp_idle_flushes"],
             self._stats["idle_window_budget_exhausted"],
             self._stats["idle_window_count_exhausted"],
+            self._stats["load_level_low"],
+            self._stats["load_level_medium"],
+            self._stats["load_level_high"],
         )
         # Log IDLE window utilization summary
         if self._idle_window_utilizations:
