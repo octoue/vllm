@@ -603,8 +603,8 @@ def test_load_level_high_ignores_phase():
     assert len(dispatched) == 10
 
 
-def test_load_level_medium_relaxes_idle_budget():
-    """MEDIUM load: IDLE window count limit is doubled."""
+def test_load_level_medium_applies_idle_budget():
+    """MEDIUM load: IDLE window count limit is strictly enforced."""
     dispatched: list[str] = []
 
     def capture_dispatch(req: TransferRequest) -> bool:
@@ -628,8 +628,8 @@ def test_load_level_medium_relaxes_idle_budget():
     assert sched._compute_load_level() == LoadLevel.MEDIUM
     sched.flush()
 
-    # MEDIUM doubles count: limit = 2*2 = 4, so 4 dispatched
-    assert len(dispatched) == 4
+    # MEDIUM enforces count limit = 2
+    assert len(dispatched) == 2
     assert sched.has_pending_transfers is True
 
 

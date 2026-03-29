@@ -209,27 +209,23 @@ class PCIeTransferScheduler:
     def _idle_window_has_budget(self) -> bool:
         """Load-adaptive IDLE window capacity check.
 
-        - LOW: strict count + time budget limits
-        - MEDIUM: doubled count limit, same time budget
-        - HIGH: no limits (return True always)
+        - LOW: no limits (IDLE windows are spacious at low load)
+        - MEDIUM: strict count + time budget limits
+        - HIGH: no limits (phase constraints already disabled)
         """
         if self._pp_phase != PPPhase.IDLE:
             return True
 
         load = self._compute_load_level()
-        if load == LoadLevel.HIGH:
+        if load != LoadLevel.MEDIUM:
             return True
 
-        # Count limit (doubled in MEDIUM)
+        # MEDIUM: apply window limits to prevent overload
         if self.max_h2d_per_idle_window > 0:
-            effective_count_limit = self.max_h2d_per_idle_window
-            if load == LoadLevel.MEDIUM:
-                effective_count_limit *= 2
-            if self._idle_window_h2d_count >= effective_count_limit:
+            if self._idle_window_h2d_count >= self.max_h2d_per_idle_window:
                 self._stats["idle_window_count_exhausted"] += 1
                 return False
 
-        # Time budget (same for LOW/MEDIUM)
         if self.idle_window_budget_ms > 0 and self._idle_window_start_time > 0:
             elapsed_ms = (time.monotonic() - self._idle_window_start_time) * 1000.0
             if elapsed_ms >= self.idle_window_budget_ms:
