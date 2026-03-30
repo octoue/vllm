@@ -3675,3 +3675,57 @@ def test_abort_request_finished_recving():
     # verify request is deleted
     assert request.request_id not in scheduler.requests
     assert not scheduler.finished_recving_kv_req_ids
+
+
+def test_kv_xfer_finished_recving_after_request_freed():
+    """finished_recving arrives for a request that was already freed.
+
+    This can happen when a request is freed earlier in update_from_output()
+    (e.g. stopped request, failed KV load) and the same kv_connector_output
+    contains a finished_recving for it.  Should not crash.
+    """
+    scheduler = create_scheduler(use_kv_connector=True)
+
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    # Simulate the request having been freed already
+    scheduler.kv_cache_manager.free(request)
+    del scheduler.requests[request.request_id]
+
+    # Send finished_recving for the freed request – must not crash
+    scheduler_output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_connector_output=KVConnectorOutput(
+            finished_recving={request.request_id}),
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.request_id not in scheduler.requests
+    assert request.request_id not in scheduler.finished_recving_kv_req_ids
+
+
+def test_kv_xfer_finished_sending_after_request_freed():
+    """finished_sending arrives for a request that was already freed."""
+    scheduler = create_scheduler(use_kv_connector=True)
+
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    # Simulate the request having been freed already
+    scheduler.kv_cache_manager.free(request)
+    del scheduler.requests[request.request_id]
+
+    # Send finished_sending for the freed request – must not crash
+    scheduler_output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_connector_output=KVConnectorOutput(
+            finished_sending={request.request_id}),
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.request_id not in scheduler.requests
