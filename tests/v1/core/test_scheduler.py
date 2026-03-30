@@ -3689,11 +3689,18 @@ def test_kv_xfer_finished_recving_after_request_freed():
     request = create_requests(num_requests=1)[0]
     scheduler.add_request(request)
 
-    # Simulate the request having been freed already
-    scheduler.kv_cache_manager.free(request)
-    del scheduler.requests[request.request_id]
+    # Put request into WAITING_FOR_REMOTE_KVS and pretend recv is already
+    # done so that finish_requests will free blocks immediately.
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.finished_recving_kv_req_ids.add(request.request_id)
 
-    # Send finished_recving for the freed request – must not crash
+    # Abort → delay_free_blocks=False (recv "done") → request fully freed
+    scheduler.finish_requests(
+        (request.request_id,), RequestStatus.FINISHED_ABORTED)
+    assert request.request_id not in scheduler.requests
+
+    # Now schedule (produces empty output) and deliver a stale
+    # finished_recving for the already-freed request.
     scheduler_output = scheduler.schedule()
     model_runner_output = ModelRunnerOutput(
         req_ids=[],
@@ -3701,6 +3708,7 @@ def test_kv_xfer_finished_recving_after_request_freed():
         kv_connector_output=KVConnectorOutput(
             finished_recving={request.request_id}),
     )
+    # Must not crash
     scheduler.update_from_output(scheduler_output, model_runner_output)
 
     assert request.request_id not in scheduler.requests
@@ -3714,11 +3722,14 @@ def test_kv_xfer_finished_sending_after_request_freed():
     request = create_requests(num_requests=1)[0]
     scheduler.add_request(request)
 
-    # Simulate the request having been freed already
-    scheduler.kv_cache_manager.free(request)
-    del scheduler.requests[request.request_id]
+    # Same setup: free the request completely first.
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.finished_recving_kv_req_ids.add(request.request_id)
+    scheduler.finish_requests(
+        (request.request_id,), RequestStatus.FINISHED_ABORTED)
+    assert request.request_id not in scheduler.requests
 
-    # Send finished_sending for the freed request – must not crash
+    # Deliver a stale finished_sending for the freed request.
     scheduler_output = scheduler.schedule()
     model_runner_output = ModelRunnerOutput(
         req_ids=[],
@@ -3726,6 +3737,7 @@ def test_kv_xfer_finished_sending_after_request_freed():
         kv_connector_output=KVConnectorOutput(
             finished_sending={request.request_id}),
     )
+    # Must not crash
     scheduler.update_from_output(scheduler_output, model_runner_output)
 
     assert request.request_id not in scheduler.requests
