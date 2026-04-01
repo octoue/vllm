@@ -173,6 +173,16 @@ class SchedulerConfig:
     Should be slightly less than actual IDLE window duration (~8.5ms).
     0 = unlimited (no time budget)."""
 
+    no_priority_queue: bool = False
+    """Ablation flag: disable priority queue for H2D transfers.
+    When True, H2D transfers use FIFO instead of priority heap,
+    ignoring Restore > Prefetch priority (PCIe scheduling only)."""
+
+    no_evict_first: bool = False
+    """Ablation flag: dispatch H2D before D2H transfers.
+    When True, reverses the default Evict-first order so H2D flushes
+    before D2H in each scheduling cycle (PCIe scheduling only)."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

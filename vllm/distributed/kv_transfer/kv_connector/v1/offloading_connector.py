@@ -663,6 +663,8 @@ class OffloadingConnectorWorker:
                 max_queue_wait_ms=sc.max_queue_wait_ms,
                 max_h2d_per_idle_window=sc.max_h2d_per_idle_window,
                 idle_window_budget_ms=sc.idle_window_budget_ms,
+                no_priority_queue=sc.no_priority_queue,
+                no_evict_first=sc.no_evict_first,
                 dispatch_fn=self._dispatch_pcie_transfer,
             )
 

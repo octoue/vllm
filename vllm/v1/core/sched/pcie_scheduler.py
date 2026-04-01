@@ -98,6 +98,8 @@ class PCIeTransferScheduler:
         max_queue_wait_ms: int = 30,
         max_h2d_per_idle_window: int = 3,
         idle_window_budget_ms: float = 7.0,
+        no_priority_queue: bool = False,
+        no_evict_first: bool = False,
         dispatch_fn: Callable[[TransferRequest], bool] | None = None,
     ):
         """Initialize the PCIe transfer scheduler.
@@ -120,6 +122,8 @@ class PCIeTransferScheduler:
         self.max_queue_wait_ms = max_queue_wait_ms
         self.max_h2d_per_idle_window = max_h2d_per_idle_window
         self.idle_window_budget_ms = idle_window_budget_ms
+        self.no_priority_queue = no_priority_queue
+        self.no_evict_first = no_evict_first
         self._dispatch_fn = dispatch_fn
         self._pending_h2d: list[tuple[int, int, TransferRequest]] = []  # Restore/Prefetch, min-heap
         self._pending_d2h: list[TransferRequest] = []  # Evict, FIFO
@@ -279,7 +283,10 @@ class PCIeTransferScheduler:
         if label == "Evict":
             self._pending_d2h.append(req)
         else:
-            heapq.heappush(self._pending_h2d, (priority, req._sequence, req))
+            if self.no_priority_queue:
+                self._pending_h2d.append((priority, req._sequence, req))
+            else:
+                heapq.heappush(self._pending_h2d, (priority, req._sequence, req))
 
         # Update statistics
         self._stats["total_submitted"] += 1
@@ -299,8 +306,12 @@ class PCIeTransferScheduler:
 
     def _flush_pending_transfers(self) -> bool:
         """Dispatch all pending (non-PP-aware mode). D2H first, then H2D."""
-        d2h_ok = self._flush_d2h()
-        h2d_ok = self._flush_h2d_transfers()
+        if self.no_evict_first:
+            h2d_ok = self._flush_h2d_transfers()
+            d2h_ok = self._flush_d2h()
+        else:
+            d2h_ok = self._flush_d2h()
+            h2d_ok = self._flush_h2d_transfers()
         return d2h_ok or h2d_ok
 
     def _flush_d2h(self) -> bool:
@@ -328,7 +339,10 @@ class PCIeTransferScheduler:
         dispatched = False
         to_push_back: list[tuple[int, int, TransferRequest]] = []
         while self._pending_h2d:
-            _, _, req = heapq.heappop(self._pending_h2d)
+            if self.no_priority_queue:
+                _, _, req = self._pending_h2d.pop(0)
+            else:
+                _, _, req = heapq.heappop(self._pending_h2d)
             if req.label != "Restore":
                 to_push_back.append((req.priority, req._sequence, req))
                 continue
@@ -347,16 +361,26 @@ class PCIeTransferScheduler:
                 to_push_back.append((req.priority, req._sequence, req))
                 break
         for item in to_push_back:
-            heapq.heappush(self._pending_h2d, item)
+            if self.no_priority_queue:
+                self._pending_h2d.append(item)
+            else:
+                heapq.heappush(self._pending_h2d, item)
         return dispatched
 
     def flush_evict_and_restore(self) -> bool:
         """Dispatch Evict + Restore immediately. Prefetch if in IDLE/FORWARD."""
-        d2h_ok = self._flush_d2h()
-        restore_ok = self._flush_restore_only()
-        prefetch_ok = False
-        if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
-            prefetch_ok = self._flush_h2d_transfers()
+        if self.no_evict_first:
+            restore_ok = self._flush_restore_only()
+            prefetch_ok = False
+            if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
+                prefetch_ok = self._flush_h2d_transfers()
+            d2h_ok = self._flush_d2h()
+        else:
+            d2h_ok = self._flush_d2h()
+            restore_ok = self._flush_restore_only()
+            prefetch_ok = False
+            if self._pp_phase in (PPPhase.IDLE, PPPhase.FORWARD):
+                prefetch_ok = self._flush_h2d_transfers()
         return d2h_ok or restore_ok or prefetch_ok
 
     def _flush_h2d_transfers(self, effective_max: int | None = None) -> bool:
@@ -384,7 +408,10 @@ class PCIeTransferScheduler:
             if not self._idle_window_has_budget():
                 break
 
-            _, _, req = heapq.heappop(self._pending_h2d)
+            if self.no_priority_queue:
+                _, _, req = self._pending_h2d.pop(0)
+            else:
+                _, _, req = heapq.heappop(self._pending_h2d)
             req.dispatch_phase = self._pp_phase.name
             req.dispatch_time = time.monotonic()
             self._active_h2d_count += 1
@@ -423,7 +450,10 @@ class PCIeTransferScheduler:
 
         items: list[tuple[int, int, TransferRequest]] = []
         while self._pending_h2d:
-            items.append(heapq.heappop(self._pending_h2d))
+            if self.no_priority_queue:
+                items.append(self._pending_h2d.pop(0))
+            else:
+                items.append(heapq.heappop(self._pending_h2d))
 
         starved: list[tuple[int, int, TransferRequest]] = []
         rest: list[tuple[int, int, TransferRequest]] = []
@@ -458,7 +488,10 @@ class PCIeTransferScheduler:
                 break
 
         for t in rest:
-            heapq.heappush(self._pending_h2d, t)
+            if self.no_priority_queue:
+                self._pending_h2d.append(t)
+            else:
+                heapq.heappush(self._pending_h2d, t)
         return dispatched
 
     def flush(self) -> bool:
@@ -488,14 +521,17 @@ class PCIeTransferScheduler:
         else:
             self._stats["load_level_high"] += 1
 
-        # D2H (Evict) first - frees blocks before H2D consumes them
-        evict_dispatched = self._flush_d2h()
-
-        # H2D with load-adaptive phase + window limits
         effective = self._effective_max_h2d_for_phase()
-        h2d_dispatched = self._flush_h2d_transfers(effective_max=effective)
-        # Starved Prefetch safety valve
-        h2d_dispatched |= self._flush_starved_prefetches()
+        if self.no_evict_first:
+            # Ablation: H2D before D2H
+            h2d_dispatched = self._flush_h2d_transfers(effective_max=effective)
+            h2d_dispatched |= self._flush_starved_prefetches()
+            evict_dispatched = self._flush_d2h()
+        else:
+            # Default: D2H (Evict) first - frees blocks before H2D consumes them
+            evict_dispatched = self._flush_d2h()
+            h2d_dispatched = self._flush_h2d_transfers(effective_max=effective)
+            h2d_dispatched |= self._flush_starved_prefetches()
 
         if not h2d_dispatched and self._pending_h2d:
             logger.debug(

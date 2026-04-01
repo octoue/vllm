@@ -1176,6 +1176,13 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--max-queue-wait-ms", **scheduler_kwargs["max_queue_wait_ms"]
         )
+        scheduler_group.add_argument(
+            "--no-priority-queue",
+            **scheduler_kwargs["no_priority_queue"]
+        )
+        scheduler_group.add_argument(
+            "--no-evict-first", **scheduler_kwargs["no_evict_first"]
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
