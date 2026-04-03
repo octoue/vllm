@@ -583,6 +583,7 @@ class EngineArgs:
     enable_pcie_scheduling: bool = SchedulerConfig.enable_pcie_scheduling
     max_concurrent_h2d: int = SchedulerConfig.max_concurrent_h2d
     prefetch_block_threshold: int = SchedulerConfig.prefetch_block_threshold
+    max_prefetch_block_ratio: float = SchedulerConfig.max_prefetch_block_ratio
     enable_pp_phase_aware: bool = SchedulerConfig.enable_pp_phase_aware
     max_queue_wait_ms: int = SchedulerConfig.max_queue_wait_ms
 
@@ -1171,6 +1172,9 @@ class EngineArgs:
             "--prefetch-block-threshold", **scheduler_kwargs["prefetch_block_threshold"]
         )
         scheduler_group.add_argument(
+            "--max-prefetch-block-ratio", **scheduler_kwargs["max_prefetch_block_ratio"]
+        )
+        scheduler_group.add_argument(
             "--enable-pp-phase-aware", **scheduler_kwargs["enable_pp_phase_aware"]
         )
         scheduler_group.add_argument(
@@ -1708,6 +1712,7 @@ class EngineArgs:
             enable_pcie_scheduling=self.enable_pcie_scheduling,
             max_concurrent_h2d=self.max_concurrent_h2d,
             prefetch_block_threshold=self.prefetch_block_threshold,
+            max_prefetch_block_ratio=self.max_prefetch_block_ratio,
             enable_pp_phase_aware=(self.enable_pp_phase_aware
                                    and envs.VLLM_PCIE_PP_PHASE_AWARE),
             max_queue_wait_ms=self.max_queue_wait_ms,
