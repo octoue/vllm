@@ -383,6 +383,9 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            # A real request consuming a prefetched block "promotes" it
+            # to a normal active block.
+            block.is_prefetched = False
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -463,6 +466,17 @@ class BlockPool:
             The number of free blocks.
         """
         return self.free_block_queue.num_free_blocks
+
+    def get_num_prefetch_blocks(self) -> int:
+        """Count blocks currently marked as loaded by prefetch.
+
+        Only counts blocks with ref_cnt > 0 (i.e. actively held,
+        not yet freed back to the eviction queue).
+        """
+        return sum(
+            1 for b in self.blocks
+            if b.is_prefetched and b.ref_cnt > 0
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

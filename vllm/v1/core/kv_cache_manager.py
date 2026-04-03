@@ -153,6 +153,10 @@ class KVCacheManager:
         """Get the number of free blocks in the pool."""
         return self.block_pool.get_num_free_blocks()
 
+    def get_num_prefetch_blocks(self) -> int:
+        """Get the number of blocks loaded by prefetch requests."""
+        return self.block_pool.get_num_prefetch_blocks()
+
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
 

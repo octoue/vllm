@@ -149,8 +149,14 @@ class SchedulerConfig:
     """Maximum concurrent H2D (Prefetch/Restore) transfers when PCIe scheduling enabled."""
 
     prefetch_block_threshold: int = Field(default=150, ge=0)
-    """Defer prefetch when free_blocks < this value (PCIe scheduling only).
+    """Defer prefetch when free_blocks < this value.
+    Applies independently of PCIe scheduling mode to protect active inference.
     测试数据显示82-100 free_blocks时发生allocation失败，提高到150保证安全裕度"""
+
+    max_prefetch_block_ratio: float = Field(default=0.3, ge=0.0, le=1.0)
+    """Maximum ratio of total GPU blocks that can be occupied by prefetch
+    blocks. When exceeded, new prefetch requests are rejected
+    (non-preemptive admission control). Set to 0 to disable quota."""
 
     enable_pp_phase_aware: bool = True
     """Align H2D transfers with PP pipeline idle windows (PCIe scheduling only)."""

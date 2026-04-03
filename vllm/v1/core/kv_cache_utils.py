@@ -124,6 +124,10 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Whether this block was loaded by a prefetch request.
+    # Used for quota tracking and statistics; cleared on eviction or touch.
+    is_prefetched: bool = False
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -138,6 +142,7 @@ class KVCacheBlock:
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+        self.is_prefetched = False
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__

@@ -183,6 +183,12 @@ class Scheduler(SchedulerInterface):
             defaultdict(list)
         )
 
+        # Prefetch statistics (cumulative, drained into SchedulerStats).
+        self._prefetch_gpu_hits: int = 0
+        self._prefetch_cpu_hits: int = 0
+        self._prefetch_no_hits: int = 0
+        self._prefetch_deferred: int = 0
+
         # Encoder-related.
         # Calculate encoder cache size if applicable
         self.supports_mm_inputs = mm_registry.supports_multimodal_inputs(
@@ -668,22 +674,46 @@ class Scheduler(SchedulerInterface):
                 # Prefetch: never do GPU compute. Finish or discard in scheduler.
                 if request.prefetch_only:
                     if num_external_computed_tokens > 0 and load_kv_async:
-                        # PCIe scheduling: defer prefetch when GPU blocks are tight.
-                        if self.scheduler_config.enable_pcie_scheduling:
-                            free_blocks = (
-                                self.kv_cache_manager.get_num_free_blocks()
+                        # Admission control: defer prefetch when GPU blocks
+                        # are tight, regardless of PCIe scheduling mode.
+                        free_blocks = (
+                            self.kv_cache_manager.get_num_free_blocks()
+                        )
+                        if free_blocks < self.scheduler_config.prefetch_block_threshold:
+                            logger.debug(
+                                "Prefetch %s: deferred (free_blocks=%d < %d)",
+                                request_id,
+                                free_blocks,
+                                self.scheduler_config.prefetch_block_threshold,
                             )
-                            if free_blocks < self.scheduler_config.prefetch_block_threshold:
+                            self._prefetch_deferred += 1
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.prepend_request(request)
+                            continue
+                        # Quota check: reject if prefetch blocks exceed limit.
+                        max_ratio = self.scheduler_config.max_prefetch_block_ratio
+                        if max_ratio > 0:
+                            num_pf_blocks = (
+                                self.kv_cache_manager.get_num_prefetch_blocks()
+                            )
+                            total_blocks = (
+                                self.kv_cache_manager.block_pool.num_gpu_blocks
+                            )
+                            if num_pf_blocks >= int(total_blocks * max_ratio):
                                 logger.debug(
-                                    "Prefetch %s: deferred (free_blocks=%d < %d)",
+                                    "Prefetch %s: quota exceeded "
+                                    "(prefetch_blocks=%d >= %d)",
                                     request_id,
-                                    free_blocks,
-                                    self.scheduler_config.prefetch_block_threshold,
+                                    num_pf_blocks,
+                                    int(total_blocks * max_ratio),
                                 )
+                                self._prefetch_deferred += 1
                                 self.waiting.pop_request()
-                                skipped_waiting_requests.prepend_request(request)
+                                request.num_cached_tokens = 0
+                                self._finish_prefetch_request(request)
                                 continue
                         # CPU offload hit: let it proceed to allocate + load.
+                        self._prefetch_cpu_hits += 1
                         logger.info(
                             "Prefetch %s: CPU hit, loading %d tokens from offload",
                             request_id,
@@ -692,6 +722,7 @@ class Scheduler(SchedulerInterface):
                         pass
                     elif num_computed_tokens > 0:
                         # GPU prefix cache hit: already in GPU, finish immediately.
+                        self._prefetch_gpu_hits += 1
                         logger.info(
                             "Prefetch %s: GPU hit, %d tokens already cached",
                             request_id,
@@ -703,6 +734,7 @@ class Scheduler(SchedulerInterface):
                         continue
                     else:
                         # No hit in GPU or CPU: discard request.
+                        self._prefetch_no_hits += 1
                         logger.info(
                             "Prefetch %s: NO HIT, discarding (tokens=%d)",
                             request_id,
@@ -810,6 +842,12 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                # Mark newly allocated blocks for prefetch requests.
+                if request.prefetch_only:
+                    for group_blocks in new_blocks.blocks:
+                        for block in group_blocks:
+                            block.is_prefetched = True
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1968,6 +2006,16 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        # Drain prefetch counters into stats snapshot.
+        prefetch_gpu_hits = self._prefetch_gpu_hits
+        prefetch_cpu_hits = self._prefetch_cpu_hits
+        prefetch_no_hits = self._prefetch_no_hits
+        prefetch_deferred = self._prefetch_deferred
+        self._prefetch_gpu_hits = 0
+        self._prefetch_cpu_hits = 0
+        self._prefetch_no_hits = 0
+        self._prefetch_deferred = 0
+
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -1980,6 +2028,10 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            prefetch_gpu_hits=prefetch_gpu_hits,
+            prefetch_cpu_hits=prefetch_cpu_hits,
+            prefetch_no_hits=prefetch_no_hits,
+            prefetch_deferred=prefetch_deferred,
         )
 
     def _get_encoder_cache_usage(self) -> float:

@@ -190,6 +190,12 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Prefetch statistics (cumulative since last drain).
+    prefetch_gpu_hits: int = 0
+    prefetch_cpu_hits: int = 0
+    prefetch_no_hits: int = 0
+    prefetch_deferred: int = 0
+
 
 @dataclass
 class RequestStateStats:
