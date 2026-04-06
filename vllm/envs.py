@@ -233,6 +233,7 @@ if TYPE_CHECKING:
     VLLM_LORA_DISABLE_PDL: bool = False
     VLLM_PCIE_SCHEDULER: bool = False
     VLLM_PCIE_PP_PHASE_AWARE: bool = True
+    VLLM_EPLB_PHASE_AWARE: bool = False
 
 
 def get_default_cache_root():
@@ -1541,6 +1542,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LORA_DISABLE_PDL": lambda: bool(int(os.getenv("VLLM_LORA_DISABLE_PDL", "0"))),
     "VLLM_PCIE_SCHEDULER": lambda: bool(int(os.getenv("VLLM_PCIE_SCHEDULER", "0"))),
     "VLLM_PCIE_PP_PHASE_AWARE": lambda: bool(int(os.getenv("VLLM_PCIE_PP_PHASE_AWARE", "1"))),
+    "VLLM_EPLB_PHASE_AWARE": lambda: bool(int(os.getenv("VLLM_EPLB_PHASE_AWARE", "0"))),
 }
 
 

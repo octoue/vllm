@@ -2637,6 +2637,31 @@ class GPUModelRunner(
             }
         )
 
+    def _setup_eplb_pcie_hooks(self) -> None:
+        """Wire EPLB rearrangement hooks to the PCIe scheduler via the KV connector."""
+        if self.eplb_state is None:
+            return
+        if not self.vllm_config.scheduler_config.enable_eplb_phase_aware:
+            return
+        try:
+            from vllm.distributed.parallel_state import get_kv_transfer_group
+            kv_connector = get_kv_transfer_group()
+            if kv_connector is None:
+                return
+            from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+                OffloadingConnector,
+            )
+            if not isinstance(kv_connector, OffloadingConnector):
+                return
+            self.eplb_state.set_pcie_scheduler_hooks(
+                on_rearrange_start=kv_connector.notify_eplb_rearrange_start,
+                on_rearrange_end=kv_connector.notify_eplb_rearrange_end,
+                on_async_migration_start=kv_connector.notify_eplb_async_migration_start,
+                on_async_migration_end=kv_connector.notify_eplb_async_migration_end,
+            )
+        except Exception:
+            logger.debug("EPLB PCIe hooks not available (no KV connector)")
+
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """
         Step for the EPLB (Expert Parallelism Load Balancing) state.
@@ -4256,6 +4281,9 @@ class GPUModelRunner(
             )
             if self.eplb_state.is_async:
                 self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
+
+            # Wire PCIe scheduler EPLB phase hooks if available
+            self._setup_eplb_pcie_hooks()
 
         if (
             self.vllm_config.compilation_config.mode

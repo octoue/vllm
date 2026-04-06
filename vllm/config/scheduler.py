@@ -189,6 +189,18 @@ class SchedulerConfig:
     When True, reverses the default Evict-first order so H2D flushes
     before D2H in each scheduling cycle (PCIe scheduling only)."""
 
+    enable_eplb_phase_aware: bool = False
+    """Enable EPLB-Phase-Aware scheduling (PCIe scheduling only).
+    When True, H2D transfers are paused during EPLB sync rearrangement
+    and concurrency is reduced during async migration.
+    Can be enabled via VLLM_EPLB_PHASE_AWARE=1 environment variable."""
+
+    eplb_async_h2d_limit: int = Field(default=1, ge=1)
+    """Maximum concurrent H2D transfers during EPLB async migration.
+    Only effective when enable_eplb_phase_aware=True and EPLB runs in
+    async mode. Reduces H2D concurrency to avoid contention with
+    background expert weight P2P transfers."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

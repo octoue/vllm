@@ -193,6 +193,38 @@ class OffloadingConnector(KVConnectorBase_V1):
             pcie.on_pp_phase_change(PPPhase.IDLE)
             pcie.flush()
 
+    # ------------------------------------------------------------------
+    # EPLB Phase-Aware hooks (called from eplb_state.py)
+    # ------------------------------------------------------------------
+
+    def notify_eplb_rearrange_start(self) -> None:
+        """EPLB sync rearrangement starting — pause H2D transfers."""
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.notify_eplb_rearrange_start()
+
+    def notify_eplb_rearrange_end(self) -> None:
+        """EPLB sync rearrangement done — flush deferred H2D transfers."""
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.notify_eplb_rearrange_end()
+
+    def notify_eplb_async_migration_start(self) -> None:
+        """EPLB async worker starting weight migration — reduce H2D CC."""
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.notify_eplb_async_migration_start()
+
+    def notify_eplb_async_migration_end(self) -> None:
+        """EPLB async worker done — restore full H2D CC."""
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.notify_eplb_async_migration_end()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
@@ -665,6 +697,8 @@ class OffloadingConnectorWorker:
                 idle_window_budget_ms=sc.idle_window_budget_ms,
                 no_priority_queue=sc.no_priority_queue,
                 no_evict_first=sc.no_evict_first,
+                enable_eplb_phase_aware=sc.enable_eplb_phase_aware,
+                eplb_async_h2d_limit=sc.eplb_async_h2d_limit,
                 dispatch_fn=self._dispatch_pcie_transfer,
             )
 

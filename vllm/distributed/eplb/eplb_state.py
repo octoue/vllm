@@ -27,7 +27,7 @@ physical experts.
 """
 
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -225,7 +225,7 @@ class EplbState:
         """
         Current step in the sliding window.
 
-        Different from `expert_rearrangement_step`, 
+        Different from `expert_rearrangement_step`,
         each EP rank may have its own `expert_load_window_step`.
         """
         self.expert_load_window_size: int = 0
@@ -264,10 +264,35 @@ class EplbState:
         """
         CUDA device index for the async EPLB worker thread.
         """
+
+        # PCIe scheduler notification callbacks (set by model runner)
+        self._on_rearrange_start: Callable[[], None] | None = None
+        self._on_rearrange_end: Callable[[], None] | None = None
+        self._on_async_migration_start: Callable[[], None] | None = None
+        self._on_async_migration_end: Callable[[], None] | None = None
+
         if self.device.type == "cuda":
             self.cuda_device_index = self.device.index
             if self.cuda_device_index is None and torch.cuda.is_available():
                 self.cuda_device_index = torch.cuda.current_device()
+
+    def set_pcie_scheduler_hooks(
+        self,
+        on_rearrange_start: Callable[[], None] | None = None,
+        on_rearrange_end: Callable[[], None] | None = None,
+        on_async_migration_start: Callable[[], None] | None = None,
+        on_async_migration_end: Callable[[], None] | None = None,
+    ) -> None:
+        """Register PCIe scheduler notification callbacks.
+
+        Called by the model runner after both EplbState and the KV connector
+        (with its PCIeTransferScheduler) are initialized.
+        """
+        self._on_rearrange_start = on_rearrange_start
+        self._on_rearrange_end = on_rearrange_end
+        self._on_async_migration_start = on_async_migration_start
+        self._on_async_migration_end = on_async_migration_end
+        logger.info("EPLB PCIe scheduler hooks registered")
 
     @staticmethod
     def build_initial_global_physical_to_logical_map(
@@ -650,6 +675,9 @@ class EplbState:
                         eplb_model_state.rebalanced = False
                         eplb_model_state.layer_to_transfer = 0
                         eplb_model_state.pending_global_ready_check = False
+                        # Notify PCIe scheduler: async migration done
+                        if self._on_async_migration_end is not None:
+                            self._on_async_migration_end()
                         logger.info(
                             "finish async transfer for model %s rank %d layer %d",
                             eplb_model_state.model_name,
@@ -817,15 +845,23 @@ class EplbState:
             )
 
             if not self.is_async or is_profile:
-                # Update expert weights
-                rearrange_expert_weights_inplace(
-                    eplb_model_state.physical_to_logical_map,
-                    new_physical_to_logical_map,
-                    eplb_model_state.model.expert_weights,
-                    ep_group,
-                    is_profile,
-                    rank_mapping,
-                )
+                # Notify PCIe scheduler: sync rearrangement starting
+                if not is_profile and self._on_rearrange_start is not None:
+                    self._on_rearrange_start()
+                try:
+                    # Update expert weights
+                    rearrange_expert_weights_inplace(
+                        eplb_model_state.physical_to_logical_map,
+                        new_physical_to_logical_map,
+                        eplb_model_state.model.expert_weights,
+                        ep_group,
+                        is_profile,
+                        rank_mapping,
+                    )
+                finally:
+                    # Notify PCIe scheduler: sync rearrangement done
+                    if not is_profile and self._on_rearrange_end is not None:
+                        self._on_rearrange_end()
 
                 if not is_profile:
                     if (
@@ -896,6 +932,9 @@ class EplbState:
 
         # Signal async thread to start transferring layers
         if self.is_async and (not is_profile):
+            # Notify PCIe scheduler: async migration starting
+            if self._on_async_migration_start is not None:
+                self._on_async_migration_start()
             self.rearrange_event.set()
         return None
 

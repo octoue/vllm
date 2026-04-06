@@ -1102,6 +1102,8 @@ class VllmConfig:
 
         if envs.VLLM_PCIE_SCHEDULER:
             self.scheduler_config.enable_pcie_scheduling = True
+        if envs.VLLM_EPLB_PHASE_AWARE:
+            self.scheduler_config.enable_eplb_phase_aware = True
 
         if self.cache_config.mamba_cache_mode == "align":
             if self.scheduler_config.long_prefill_token_threshold > 0:

@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PCIe transfer scheduler for coordinating KV cache transfers with PP pipeline phases.
+"""PCIe transfer scheduler for coordinating KV cache transfers with PP/EPLB phases.
 
 Coordinates H2D (Prefetch/Restore), D2H (Evict), and P2P (Pipeline Parallel) operations
 to reduce PCIe bandwidth contention in single-node multi-GPU environments.
+
+EPLB-Phase-Aware scheduling:
+  - Sync rearrangement: pause all H2D during rearrangement, flush on completion
+  - Async migration: reduce H2D concurrency while async worker transfers weights
 """
 
 from __future__ import annotations
@@ -100,6 +104,8 @@ class PCIeTransferScheduler:
         idle_window_budget_ms: float = 7.0,
         no_priority_queue: bool = False,
         no_evict_first: bool = False,
+        enable_eplb_phase_aware: bool = False,
+        eplb_async_h2d_limit: int = 1,
         dispatch_fn: Callable[[TransferRequest], bool] | None = None,
     ):
         """Initialize the PCIe transfer scheduler.
@@ -113,6 +119,8 @@ class PCIeTransferScheduler:
             max_h2d_per_idle_window: Max H2D dispatches per IDLE window (0=unlimited).
                 Also used as denominator for load-level computation.
             idle_window_budget_ms: Time budget per IDLE window in ms (0=unlimited).
+            enable_eplb_phase_aware: Pause H2D during EPLB rearrangement.
+            eplb_async_h2d_limit: Max concurrent H2D during async EPLB migration.
             dispatch_fn: Callback to execute a transfer; receives (spec, label).
         """
         self.max_concurrent_h2d = max_concurrent_h2d
@@ -124,12 +132,18 @@ class PCIeTransferScheduler:
         self.idle_window_budget_ms = idle_window_budget_ms
         self.no_priority_queue = no_priority_queue
         self.no_evict_first = no_evict_first
+        self.enable_eplb_phase_aware = enable_eplb_phase_aware
+        self.eplb_async_h2d_limit = eplb_async_h2d_limit
         self._dispatch_fn = dispatch_fn
         self._pending_h2d: list[tuple[int, int, TransferRequest]] = []  # Restore/Prefetch, min-heap
         self._pending_d2h: list[TransferRequest] = []  # Evict, FIFO
         self._sequence_counter = 0
         self._active_h2d_count = 0
         self._pp_phase = PPPhase.IDLE
+
+        # EPLB phase state
+        self._eplb_rearranging = False  # sync rearrangement in progress
+        self._eplb_async_migrating = False  # async weight migration in progress
 
         # Idle window capacity tracking
         self._idle_window_h2d_count = 0  # H2D dispatched in current IDLE window
@@ -156,6 +170,10 @@ class PCIeTransferScheduler:
             "load_level_low": 0,
             "load_level_medium": 0,
             "load_level_high": 0,
+            "eplb_rearrange_pauses": 0,
+            "eplb_h2d_deferred_during_rearrange": 0,
+            "eplb_async_cc_reductions": 0,
+            "eplb_post_rearrange_flushes": 0,
         }
 
     def should_defer_prefetch(self, free_blocks: int) -> bool:
@@ -389,8 +407,14 @@ class PCIeTransferScheduler:
         Respects effective_max concurrent active H2D (defaults to max_concurrent_h2d).
         Restore (priority 0) before Prefetch (1).
         Phase 1: Also respects IDLE window capacity limits.
+        EPLB-aware: blocks H2D during sync rearrangement; reduces CC during async.
         """
         if self._dispatch_fn is None or not self._pending_h2d:
+            return False
+
+        # EPLB sync rearrangement: completely pause H2D
+        if self._eplb_rearranging:
+            self._stats["eplb_h2d_deferred_during_rearrange"] += len(self._pending_h2d)
             return False
 
         limit = (
@@ -398,6 +422,10 @@ class PCIeTransferScheduler:
             if effective_max is not None
             else self.max_concurrent_h2d
         )
+
+        # EPLB async migration: cap concurrency
+        if self._eplb_async_migrating:
+            limit = min(limit, self.eplb_async_h2d_limit)
         dispatched = False
         while self._pending_h2d:
             if self._active_h2d_count >= limit:
@@ -597,6 +625,64 @@ class PCIeTransferScheduler:
                 self._stats["pp_idle_flushes"] += 1
                 self.flush()
 
+    # ------------------------------------------------------------------
+    # EPLB Phase-Aware hooks
+    # ------------------------------------------------------------------
+
+    def notify_eplb_rearrange_start(self) -> None:
+        """Called when EPLB sync rearrangement begins.
+
+        Pauses all H2D dispatches to avoid contending with P2P expert weight
+        transfers on the PCIe link. D2H (Evict) is still allowed since it
+        frees GPU memory that rearrangement may need.
+        """
+        if not self.enable_eplb_phase_aware:
+            return
+        self._eplb_rearranging = True
+        self._stats["eplb_rearrange_pauses"] += 1
+        logger.debug("EPLB rearrange START — H2D paused")
+
+    def notify_eplb_rearrange_end(self) -> None:
+        """Called when EPLB sync rearrangement completes.
+
+        Resumes H2D dispatches and immediately flushes any transfers that
+        accumulated during the pause.
+        """
+        if not self.enable_eplb_phase_aware:
+            return
+        self._eplb_rearranging = False
+        logger.debug("EPLB rearrange END — flushing %d pending H2D",
+                     len(self._pending_h2d))
+        if self._pending_h2d or self._pending_d2h:
+            self._stats["eplb_post_rearrange_flushes"] += 1
+            self.flush()
+
+    def notify_eplb_async_migration_start(self) -> None:
+        """Called when EPLB async worker begins transferring expert weights.
+
+        Reduces H2D concurrency to eplb_async_h2d_limit (default 1) so that
+        KV cache transfers don't fully contend with the background P2P stream.
+        """
+        if not self.enable_eplb_phase_aware:
+            return
+        self._eplb_async_migrating = True
+        self._stats["eplb_async_cc_reductions"] += 1
+        logger.debug("EPLB async migration START — H2D CC reduced to %d",
+                     self.eplb_async_h2d_limit)
+
+    def notify_eplb_async_migration_end(self) -> None:
+        """Called when EPLB async worker finishes all layer transfers.
+
+        Restores full H2D concurrency and flushes pending transfers.
+        """
+        if not self.enable_eplb_phase_aware:
+            return
+        self._eplb_async_migrating = False
+        logger.debug("EPLB async migration END — H2D CC restored to %d",
+                     self.max_concurrent_h2d)
+        if self._pending_h2d or self._pending_d2h:
+            self.flush()
+
     @property
     def has_pending_transfers(self) -> bool:
         """Return True if there are queued transfers."""
@@ -613,7 +699,8 @@ class PCIeTransferScheduler:
             "restore=%d, prefetch=%d (starved=%d), evict=%d, max_queue=%d, "
             "throttled=%d, pp_idle_flushes=%d, "
             "idle_budget_exhausted=%d, idle_count_exhausted=%d, "
-            "load_levels=[L=%d M=%d H=%d]",
+            "load_levels=[L=%d M=%d H=%d], "
+            "eplb=[pauses=%d deferred=%d async_cc=%d flushes=%d]",
             self._stats["total_submitted"],
             self._stats["prefetch_deferred"],
             self._stats["restore_dispatched"],
@@ -628,6 +715,10 @@ class PCIeTransferScheduler:
             self._stats["load_level_low"],
             self._stats["load_level_medium"],
             self._stats["load_level_high"],
+            self._stats["eplb_rearrange_pauses"],
+            self._stats["eplb_h2d_deferred_during_rearrange"],
+            self._stats["eplb_async_cc_reductions"],
+            self._stats["eplb_post_rearrange_flushes"],
         )
         # Log IDLE window utilization summary
         if self._idle_window_utilizations:
