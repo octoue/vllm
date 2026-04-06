@@ -2644,14 +2644,15 @@ class GPUModelRunner(
         if not self.vllm_config.scheduler_config.enable_eplb_phase_aware:
             return
         try:
-            from vllm.distributed.parallel_state import get_kv_transfer_group
-            kv_connector = get_kv_transfer_group()
-            if kv_connector is None:
+            if not has_kv_transfer_group():
                 return
+            kv_connector = get_kv_transfer_group()
             from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
                 OffloadingConnector,
             )
             if not isinstance(kv_connector, OffloadingConnector):
+                logger.debug("EPLB PCIe hooks: connector is %s, not OffloadingConnector",
+                             type(kv_connector).__name__)
                 return
             self.eplb_state.set_pcie_scheduler_hooks(
                 on_rearrange_start=kv_connector.notify_eplb_rearrange_start,
@@ -2659,8 +2660,8 @@ class GPUModelRunner(
                 on_async_migration_start=kv_connector.notify_eplb_async_migration_start,
                 on_async_migration_end=kv_connector.notify_eplb_async_migration_end,
             )
-        except Exception:
-            logger.debug("EPLB PCIe hooks not available (no KV connector)")
+        except Exception as e:
+            logger.warning("EPLB PCIe hooks setup failed: %s", e)
 
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """
