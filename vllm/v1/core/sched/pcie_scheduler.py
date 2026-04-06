@@ -228,18 +228,23 @@ class PCIeTransferScheduler:
             return self.max_concurrent_h2d
         return min(1, self.max_concurrent_h2d)
 
-    def _idle_window_has_budget(self) -> bool:
-        """Load-adaptive IDLE window capacity check.
+    def _idle_window_has_budget(
+        self, load_override: LoadLevel | None = None
+    ) -> bool:
+        """IDLE window capacity check.
 
-        - LOW: no limits (IDLE windows are spacious at low load)
-        - MEDIUM: strict count + time budget limits
-        - HIGH: no limits (phase constraints already disabled)
+        Enforces count and time budget limits when in IDLE phase,
+        unless load is HIGH (phase constraints fully disabled).
+
+        Args:
+            load_override: If provided, use this load level instead of
+                recomputing. Prevents mid-flush level drift as items drain.
         """
         if self._pp_phase != PPPhase.IDLE:
             return True
 
-        load = self._compute_load_level()
-        if load != LoadLevel.MEDIUM:
+        load = load_override if load_override is not None else self._compute_load_level()
+        if load == LoadLevel.HIGH:
             return True
 
         # MEDIUM: apply window limits to prevent overload
@@ -426,6 +431,10 @@ class PCIeTransferScheduler:
         # EPLB async migration: cap concurrency
         if self._eplb_async_migrating:
             limit = min(limit, self.eplb_async_h2d_limit)
+
+        # Snapshot load level once to prevent mid-flush drift as items drain
+        snapped_load = self._compute_load_level()
+
         dispatched = False
         while self._pending_h2d:
             if self._active_h2d_count >= limit:
@@ -433,7 +442,7 @@ class PCIeTransferScheduler:
                 break
 
             # Phase 1: Check IDLE window budget before dispatching
-            if not self._idle_window_has_budget():
+            if not self._idle_window_has_budget(load_override=snapped_load):
                 break
 
             if self.no_priority_queue:
@@ -529,7 +538,7 @@ class PCIeTransferScheduler:
         1. D2H (Evict) - dispatch anytime, Evict-first to free blocks
         2. H2D - load-adaptive phase limit:
            - LOW/MEDIUM: IDLE/FORWARD full concurrency, RECV/SEND at most 1
-             + IDLE window budget (strict in LOW, relaxed in MEDIUM)
+             + IDLE window count/time budget
            - HIGH: no phase restriction, no window limits (G2-mode)
         3. Starved Prefetch - bypass phase cap after max_queue_wait_ms
         """
