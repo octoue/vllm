@@ -2638,14 +2638,19 @@ class GPUModelRunner(
         )
 
     def _setup_eplb_pcie_hooks(self) -> None:
-        """Wire EPLB rearrangement hooks to the PCIe scheduler via the KV connector."""
+        """Wire EPLB rearrangement hooks to the PCIe scheduler via the KV connector.
+
+        Called lazily from eplb_step() since during model init the KV connector
+        may not yet be created (it's initialized after EPLB state).
+        """
         if self.eplb_state is None:
             return
         if not self.vllm_config.scheduler_config.enable_eplb_phase_aware:
+            self._eplb_pcie_hooks_done = True  # don't retry
             return
         try:
             if not has_kv_transfer_group():
-                return
+                return  # not ready yet, retry next step
             kv_connector = get_kv_transfer_group()
             from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
                 OffloadingConnector,
@@ -2653,6 +2658,7 @@ class GPUModelRunner(
             if not isinstance(kv_connector, OffloadingConnector):
                 logger.debug("EPLB PCIe hooks: connector is %s, not OffloadingConnector",
                              type(kv_connector).__name__)
+                self._eplb_pcie_hooks_done = True
                 return
             self.eplb_state.set_pcie_scheduler_hooks(
                 on_rearrange_start=kv_connector.notify_eplb_rearrange_start,
@@ -2660,8 +2666,10 @@ class GPUModelRunner(
                 on_async_migration_start=kv_connector.notify_eplb_async_migration_start,
                 on_async_migration_end=kv_connector.notify_eplb_async_migration_end,
             )
+            self._eplb_pcie_hooks_done = True
         except Exception as e:
             logger.warning("EPLB PCIe hooks setup failed: %s", e)
+            self._eplb_pcie_hooks_done = True
 
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """
@@ -2669,6 +2677,10 @@ class GPUModelRunner(
         """
         if not self.parallel_config.enable_eplb:
             return
+
+        # Lazy hook setup: KV connector not available at model init time
+        if not getattr(self, '_eplb_pcie_hooks_done', False):
+            self._setup_eplb_pcie_hooks()
 
         assert self.eplb_state is not None
         model = self.get_model()
@@ -4283,8 +4295,8 @@ class GPUModelRunner(
             if self.eplb_state.is_async:
                 self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
 
-            # Wire PCIe scheduler EPLB phase hooks if available
-            self._setup_eplb_pcie_hooks()
+            # NOTE: EPLB PCIe hooks are set up lazily in eplb_step(),
+            # because the KV connector is not yet created at this point.
 
         if (
             self.vllm_config.compilation_config.mode
