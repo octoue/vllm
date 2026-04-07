@@ -174,6 +174,7 @@ class PCIeTransferScheduler:
             "eplb_h2d_deferred_during_rearrange": 0,
             "eplb_async_cc_reductions": 0,
             "eplb_post_rearrange_flushes": 0,
+            "eplb_inter_layer_flushes": 0,
         }
 
     def should_defer_prefetch(self, free_blocks: int) -> bool:
@@ -666,6 +667,27 @@ class PCIeTransferScheduler:
             self._stats["eplb_post_rearrange_flushes"] += 1
             self.flush()
 
+    def notify_eplb_layer_complete(self, layer_idx: int,
+                                   total_layers: int) -> None:
+        """Called between EPLB sync rearrangement layers.
+
+        Temporarily lifts the H2D pause to flush pending D2H (evict)
+        transfers, then re-pauses for the next layer. This creates
+        interleaving windows where KV cache transfers can proceed
+        between EPLB weight transfers.
+        """
+        if not self.enable_eplb_phase_aware:
+            return
+        # Temporarily allow transfers and flush D2H
+        self._eplb_rearranging = False
+        if self._pending_d2h or self._pending_h2d:
+            self.flush()
+        # Re-pause for next layer (unless this was the last layer —
+        # notify_eplb_rearrange_end will handle the final unpause)
+        if layer_idx < total_layers - 1:
+            self._eplb_rearranging = True
+        self._stats["eplb_inter_layer_flushes"] += 1
+
     def notify_eplb_async_migration_start(self) -> None:
         """Called when EPLB async worker begins transferring expert weights.
 
@@ -709,7 +731,8 @@ class PCIeTransferScheduler:
             "throttled=%d, pp_idle_flushes=%d, "
             "idle_budget_exhausted=%d, idle_count_exhausted=%d, "
             "load_levels=[L=%d M=%d H=%d], "
-            "eplb=[pauses=%d deferred=%d async_cc=%d flushes=%d]",
+            "eplb=[pauses=%d deferred=%d async_cc=%d flushes=%d "
+            "inter_layer=%d]",
             self._stats["total_submitted"],
             self._stats["prefetch_deferred"],
             self._stats["restore_dispatched"],
@@ -728,6 +751,7 @@ class PCIeTransferScheduler:
             self._stats["eplb_h2d_deferred_during_rearrange"],
             self._stats["eplb_async_cc_reductions"],
             self._stats["eplb_post_rearrange_flushes"],
+            self._stats["eplb_inter_layer_flushes"],
         )
         # Log IDLE window utilization summary
         if self._idle_window_utilizations:

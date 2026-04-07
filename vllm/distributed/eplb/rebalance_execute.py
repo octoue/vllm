@@ -6,7 +6,7 @@ The actual execution of the rearrangement.
 This involves the exchange of expert weights between GPUs.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -515,6 +515,7 @@ def rearrange_expert_weights_inplace(
     ep_group: ProcessGroup,
     is_profile: bool = False,
     rank_mapping: dict[int, int] | None = None,
+    on_layer_complete: Callable[[int, int], None] | None = None,
 ) -> None:
     """
     Rearranges the expert weights in place according to the new expert indices.
@@ -534,6 +535,10 @@ def rearrange_expert_weights_inplace(
             This is used during profile run, where we only perform dummy
             communications to reserve enough memory for the buffers.
         rank_mapping: A dictionary mapping old rank to new rank.
+        on_layer_complete: Optional callback invoked after each layer's
+            weight transfer completes, with (layer_idx, total_layers).
+            Used by the PCIe scheduler to flush KV transfers between
+            EPLB layers.
     """
     if rank_mapping is not None:
         if len(rank_mapping) == ep_group.size():
@@ -608,6 +613,9 @@ def rearrange_expert_weights_inplace(
             new_indices=new_global_expert_indices_cpu[layer_idx],
             ep_rank=ep_group.rank(),
         )
+
+        if on_layer_complete is not None:
+            on_layer_complete(layer_idx, num_moe_layers)
 
 
 def _map_old_expert_indices_with_rank_mapping(

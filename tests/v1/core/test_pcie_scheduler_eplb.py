@@ -217,6 +217,80 @@ def test_eplb_phase_aware_disabled_noop():
 
 
 # ------------------------------------------------------------------
+# Inter-layer flush during sync rearrangement
+# ------------------------------------------------------------------
+
+
+def test_eplb_inter_layer_flushes_d2h():
+    """Between EPLB layers, pending D2H and H2D are flushed."""
+    sched, dispatched = _make_scheduler()
+
+    sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+
+    sched.notify_eplb_rearrange_start()
+    sched.flush()
+    # Only Evict goes through during rearrange
+    assert dispatched == ["Evict"]
+    dispatched.clear()
+
+    # Submit more during rearrange
+    sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
+    sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="p1")
+
+    # Inter-layer flush (not last layer)
+    sched.notify_eplb_layer_complete(0, 32)
+
+    # Both D2H and H2D should flush during the inter-layer window
+    assert "Evict" in dispatched
+    assert "Restore" in dispatched
+    assert "Prefetch" in dispatched
+    assert sched._stats["eplb_inter_layer_flushes"] == 1
+    # Should re-pause for next layer
+    assert sched._eplb_rearranging is True
+
+
+def test_eplb_inter_layer_last_layer_unpauses():
+    """On the last layer, inter-layer flush does not re-pause."""
+    sched, dispatched = _make_scheduler()
+
+    sched.notify_eplb_rearrange_start()
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+
+    # Last layer (31 of 32)
+    sched.notify_eplb_layer_complete(31, 32)
+
+    assert "Restore" in dispatched
+    # Should NOT re-pause since it's the last layer
+    assert sched._eplb_rearranging is False
+
+
+def test_eplb_inter_layer_disabled_noop():
+    """Inter-layer flush is a no-op when EPLB phase-aware is disabled."""
+    sched, dispatched = _make_scheduler(enable_eplb_phase_aware=False)
+
+    sched.notify_eplb_rearrange_start()
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+
+    sched.notify_eplb_layer_complete(0, 32)
+
+    # With phase-aware disabled, rearrange_start was a no-op,
+    # so flush in layer_complete also skips
+    assert sched._stats["eplb_inter_layer_flushes"] == 0
+
+
+def test_eplb_inter_layer_stats():
+    """Inter-layer flush stats accumulate correctly across layers."""
+    sched, dispatched = _make_scheduler()
+
+    sched.notify_eplb_rearrange_start()
+    for i in range(5):
+        sched.notify_eplb_layer_complete(i, 32)
+
+    assert sched._stats["eplb_inter_layer_flushes"] == 5
+
+
+# ------------------------------------------------------------------
 # Combined PP + EPLB phase interaction
 # ------------------------------------------------------------------
 

@@ -270,6 +270,7 @@ class EplbState:
         self._on_rearrange_end: Callable[[], None] | None = None
         self._on_async_migration_start: Callable[[], None] | None = None
         self._on_async_migration_end: Callable[[], None] | None = None
+        self._on_layer_complete: Callable[[int, int], None] | None = None
 
         if self.device.type == "cuda":
             self.cuda_device_index = self.device.index
@@ -282,6 +283,7 @@ class EplbState:
         on_rearrange_end: Callable[[], None] | None = None,
         on_async_migration_start: Callable[[], None] | None = None,
         on_async_migration_end: Callable[[], None] | None = None,
+        on_layer_complete: Callable[[int, int], None] | None = None,
     ) -> None:
         """Register PCIe scheduler notification callbacks.
 
@@ -292,6 +294,7 @@ class EplbState:
         self._on_rearrange_end = on_rearrange_end
         self._on_async_migration_start = on_async_migration_start
         self._on_async_migration_end = on_async_migration_end
+        self._on_layer_complete = on_layer_complete
         logger.info("EPLB PCIe scheduler hooks registered")
 
     @staticmethod
@@ -857,6 +860,10 @@ class EplbState:
                         ep_group,
                         is_profile,
                         rank_mapping,
+                        on_layer_complete=(
+                            self._on_layer_complete
+                            if not is_profile else None
+                        ),
                     )
                 finally:
                     # Notify PCIe scheduler: sync rearrangement done

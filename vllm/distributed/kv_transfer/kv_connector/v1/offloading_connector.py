@@ -211,6 +211,14 @@ class OffloadingConnector(KVConnectorBase_V1):
         ) is not None:
             pcie.notify_eplb_rearrange_end()
 
+    def notify_eplb_layer_complete(self, layer_idx: int,
+                                   total_layers: int) -> None:
+        """EPLB sync layer transfer done — flush KV transfers between layers."""
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.notify_eplb_layer_complete(layer_idx, total_layers)
+
     def notify_eplb_async_migration_start(self) -> None:
         """EPLB async worker starting weight migration — reduce H2D CC."""
         if self.connector_worker is not None and (
@@ -392,9 +400,19 @@ class OffloadingConnectorScheduler:
             return 0, False
 
         start_block_idx = num_computed_tokens // self.offloaded_block_size
-        hits = self.manager.lookup(
+        lookup_hashes = list(
             self._get_block_hashes(request, start_idx=start_block_idx)
         )
+        logger.info(
+            "Request %s: offload lookup start_block=%d, "
+            "lookup_blocks=%d, cpu_blocks=%d, gpu_tokens=%d",
+            request.request_id,
+            start_block_idx,
+            len(lookup_hashes),
+            len(self.manager.blocks),
+            num_computed_tokens,
+        )
+        hits = self.manager.lookup(iter(lookup_hashes))
         if hits is None:
             # indicates a lookup that should be tried later
             return None, False
@@ -536,7 +554,20 @@ class OffloadingConnectorScheduler:
             self._next_stored_block_idx[req_id] = num_blocks
 
             if not store_output.block_hashes_to_store:
+                logger.debug(
+                    "Request %s: all %d blocks already in CPU (skipped)",
+                    req_id,
+                    num_new_blocks,
+                )
                 continue
+            logger.info(
+                "Request %s: storing %d new blocks to CPU "
+                "(total cpu_blocks=%d, evicted=%d)",
+                req_id,
+                len(store_output.block_hashes_to_store),
+                len(self.manager.blocks),
+                len(store_output.block_hashes_evicted),
+            )
             block_hashes_to_store = set(store_output.block_hashes_to_store)
 
             block_hashes = self._get_block_hashes(req, end_idx=num_blocks)
@@ -881,6 +912,12 @@ class OffloadingConnectorWorker:
                     transfer_type=transfer_result.transfer_type,
                 )
             if store:
+                logger.debug(
+                    "Store job %s complete for req %s, cpu_blocks=%d",
+                    job_id,
+                    req_id,
+                    len(self.manager.blocks) if self.manager else -1,
+                )
                 req_jobs = self._store_jobs[req_id]
                 req_jobs.remove(job_id)
                 if req_jobs:

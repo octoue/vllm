@@ -2665,6 +2665,7 @@ class GPUModelRunner(
                 on_rearrange_end=kv_connector.notify_eplb_rearrange_end,
                 on_async_migration_start=kv_connector.notify_eplb_async_migration_start,
                 on_async_migration_end=kv_connector.notify_eplb_async_migration_end,
+                on_layer_complete=kv_connector.notify_eplb_layer_complete,
             )
             self._eplb_pcie_hooks_done = True
         except Exception as e:
