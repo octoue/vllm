@@ -2669,8 +2669,7 @@ class GPUModelRunner(
             )
             self._eplb_pcie_hooks_done = True
         except Exception as e:
-            logger.warning("EPLB PCIe hooks setup failed: %s", e)
-            self._eplb_pcie_hooks_done = True
+            logger.warning("EPLB PCIe hooks setup failed (will retry): %s", e)
 
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """
