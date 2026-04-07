@@ -913,10 +913,9 @@ class OffloadingConnectorWorker:
                 )
             if store:
                 logger.debug(
-                    "Store job %s complete for req %s, cpu_blocks=%d",
+                    "Store job %s complete for req %s",
                     job_id,
                     req_id,
-                    len(self.manager.blocks) if self.manager else -1,
                 )
                 req_jobs = self._store_jobs[req_id]
                 req_jobs.remove(job_id)
