@@ -671,21 +671,16 @@ class PCIeTransferScheduler:
                                    total_layers: int) -> None:
         """Called between EPLB sync rearrangement layers.
 
-        Temporarily lifts the H2D pause to flush pending D2H (evict)
-        transfers, then re-pauses for the next layer. This creates
-        interleaving windows where KV cache transfers can proceed
-        between EPLB weight transfers.
+        Only flushes D2H (evict) to free GPU memory for the next layer.
+        H2D (restore/prefetch) stays paused because the GPU is still
+        busy with rearrangement — dispatching H2D here would just
+        cause throttling and queue buildup.
         """
         if not self.enable_eplb_phase_aware:
             return
-        # Temporarily allow transfers and flush D2H
-        self._eplb_rearranging = False
-        if self._pending_d2h or self._pending_h2d:
-            self.flush()
-        # Re-pause for next layer (unless this was the last layer —
-        # notify_eplb_rearrange_end will handle the final unpause)
-        if layer_idx < total_layers - 1:
-            self._eplb_rearranging = True
+        # Flush only D2H (evict) — frees GPU blocks for rearrangement
+        if self._pending_d2h:
+            self._flush_d2h()
         self._stats["eplb_inter_layer_flushes"] += 1
 
     def notify_eplb_async_migration_start(self) -> None:

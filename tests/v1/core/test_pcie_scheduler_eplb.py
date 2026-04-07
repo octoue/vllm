@@ -221,8 +221,8 @@ def test_eplb_phase_aware_disabled_noop():
 # ------------------------------------------------------------------
 
 
-def test_eplb_inter_layer_flushes_d2h():
-    """Between EPLB layers, pending D2H and H2D are flushed."""
+def test_eplb_inter_layer_flushes_only_d2h():
+    """Between EPLB layers, only D2H (evict) is flushed; H2D stays paused."""
     sched, dispatched = _make_scheduler()
 
     sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
@@ -241,28 +241,30 @@ def test_eplb_inter_layer_flushes_d2h():
     # Inter-layer flush (not last layer)
     sched.notify_eplb_layer_complete(0, 32)
 
-    # Both D2H and H2D should flush during the inter-layer window
+    # Only D2H should flush; H2D stays paused
     assert "Evict" in dispatched
-    assert "Restore" in dispatched
-    assert "Prefetch" in dispatched
+    assert "Restore" not in dispatched, "H2D should stay paused during rearrange"
+    assert "Prefetch" not in dispatched, "H2D should stay paused during rearrange"
     assert sched._stats["eplb_inter_layer_flushes"] == 1
-    # Should re-pause for next layer
+    # Should still be paused
     assert sched._eplb_rearranging is True
 
 
-def test_eplb_inter_layer_last_layer_unpauses():
-    """On the last layer, inter-layer flush does not re-pause."""
+def test_eplb_inter_layer_h2d_flushed_after_rearrange_end():
+    """H2D accumulated during rearrange are flushed when rearrange ends."""
     sched, dispatched = _make_scheduler()
 
     sched.notify_eplb_rearrange_start()
     sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
 
-    # Last layer (31 of 32)
-    sched.notify_eplb_layer_complete(31, 32)
+    # Inter-layer only flushes D2H
+    sched.notify_eplb_layer_complete(0, 32)
+    assert dispatched == ["Evict"]
 
+    # Rearrange ends — now H2D should flush
+    sched.notify_eplb_rearrange_end()
     assert "Restore" in dispatched
-    # Should NOT re-pause since it's the last layer
-    assert sched._eplb_rearranging is False
 
 
 def test_eplb_inter_layer_disabled_noop():
