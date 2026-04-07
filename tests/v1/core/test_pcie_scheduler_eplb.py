@@ -402,7 +402,9 @@ def test_eplb_async_layer_transfer_end_restores_cc():
 
 def test_eplb_async_between_layers_full_cc():
     """Between layer transfers (gap), H2D runs at full concurrency."""
-    sched, dispatched = _make_scheduler(max_concurrent_h2d=4, eplb_async_h2d_limit=1)
+    sched, dispatched = _make_scheduler(
+        max_concurrent_h2d=4, eplb_async_h2d_limit=1, max_h2d_per_idle_window=0,
+    )
 
     sched.notify_eplb_async_migration_start()
 
@@ -434,7 +436,9 @@ def test_eplb_async_between_layers_full_cc():
 
 def test_eplb_async_migration_not_limiting_between_layers():
     """async_migrating flag alone (without layer_transferring) does NOT limit H2D."""
-    sched, dispatched = _make_scheduler(max_concurrent_h2d=4, eplb_async_h2d_limit=1)
+    sched, dispatched = _make_scheduler(
+        max_concurrent_h2d=4, eplb_async_h2d_limit=1, max_h2d_per_idle_window=0,
+    )
 
     sched.notify_eplb_async_migration_start()
     # No layer transfer active — full CC should be available
