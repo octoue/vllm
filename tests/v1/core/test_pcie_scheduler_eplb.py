@@ -131,7 +131,7 @@ def test_eplb_rearrange_stats():
 
 
 def test_eplb_async_reduces_cc():
-    """During async migration, H2D concurrency is reduced to eplb_async_h2d_limit."""
+    """During async migration with active layer transfer, H2D CC is reduced."""
     sched, dispatched = _make_scheduler(max_concurrent_h2d=4, eplb_async_h2d_limit=1)
 
     sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
@@ -139,9 +139,10 @@ def test_eplb_async_reduces_cc():
     sched.submit_transfer(None, TransferPriority.PREFETCH, "Prefetch", req_id="p1")
 
     sched.notify_eplb_async_migration_start()
+    sched.notify_eplb_async_layer_transfer_start()
     sched.flush()
 
-    # Only 1 dispatched due to async CC limit
+    # Only 1 dispatched due to per-layer CC limit
     assert len(dispatched) == 1
     assert sched._active_h2d_count == 1
     assert sched._stats["eplb_async_cc_reductions"] == 1
@@ -156,6 +157,7 @@ def test_eplb_async_end_restores_cc():
     sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r3")
 
     sched.notify_eplb_async_migration_start()
+    sched.notify_eplb_async_layer_transfer_start()
     sched.flush()
     assert len(dispatched) == 1
 
@@ -169,7 +171,7 @@ def test_eplb_async_end_restores_cc():
 
 
 def test_eplb_async_d2h_unaffected():
-    """Async migration CC reduction does not affect D2H transfers."""
+    """Async layer transfer CC reduction does not affect D2H transfers."""
     sched, dispatched = _make_scheduler(max_concurrent_h2d=4, eplb_async_h2d_limit=1)
 
     sched.submit_transfer(None, TransferPriority.EVICT, "Evict")
@@ -178,12 +180,13 @@ def test_eplb_async_d2h_unaffected():
     sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r2")
 
     sched.notify_eplb_async_migration_start()
+    sched.notify_eplb_async_layer_transfer_start()
     sched.flush()
 
     evict_count = dispatched.count("Evict")
     restore_count = dispatched.count("Restore")
     assert evict_count == 2, "All D2H should go through"
-    assert restore_count == 1, "Only 1 H2D due to async CC limit"
+    assert restore_count == 1, "Only 1 H2D due to per-layer CC limit"
 
 
 # ------------------------------------------------------------------
@@ -350,3 +353,115 @@ def test_eplb_state_hooks_called():
         state._on_async_migration_end()
 
     assert calls == ["start", "end", "async_start", "async_end"]
+
+
+# ------------------------------------------------------------------
+# Per-layer async transfer: fine-grained H2D CC control
+# ------------------------------------------------------------------
+
+
+def test_eplb_async_layer_transfer_reduces_cc():
+    """During a single layer P2P transfer, H2D CC is reduced."""
+    sched, dispatched = _make_scheduler(max_concurrent_h2d=4, eplb_async_h2d_limit=1)
+
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r2")
+
+    sched.notify_eplb_async_migration_start()
+    sched.notify_eplb_async_layer_transfer_start()
+    sched.flush()
+
+    # Only 1 dispatched due to per-layer CC limit
+    assert len(dispatched) == 1
+    assert sched._active_h2d_count == 1
+    assert sched._stats["eplb_async_layer_transfers"] == 1
+
+
+def test_eplb_async_layer_transfer_end_restores_cc():
+    """After a layer P2P transfer ends, full H2D CC is restored."""
+    sched, dispatched = _make_scheduler(max_concurrent_h2d=4, eplb_async_h2d_limit=1)
+
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r2")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r3")
+
+    sched.notify_eplb_async_migration_start()
+    sched.notify_eplb_async_layer_transfer_start()
+    sched.flush()
+    assert len(dispatched) == 1
+
+    # Complete the first transfer, then end layer transfer
+    sched.on_transfer_completed("Restore")
+    sched.notify_eplb_async_layer_transfer_end()
+
+    # Full CC=4 restored between layers, remaining should flush
+    assert len(dispatched) == 3
+    assert sched._eplb_async_layer_transferring is False
+    assert sched._stats["eplb_async_layer_flushes"] == 1
+
+
+def test_eplb_async_between_layers_full_cc():
+    """Between layer transfers (gap), H2D runs at full concurrency."""
+    sched, dispatched = _make_scheduler(max_concurrent_h2d=4, eplb_async_h2d_limit=1)
+
+    sched.notify_eplb_async_migration_start()
+
+    # Layer 0 transfer
+    sched.notify_eplb_async_layer_transfer_start()
+    sched.notify_eplb_async_layer_transfer_end()
+
+    # Gap between layers — submit and flush with full CC
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r2")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r3")
+    sched.flush()
+
+    # All 3 should dispatch — we're between layers, full CC=4
+    assert len(dispatched) == 3
+
+    # Layer 1 transfer starts — new submissions should be limited again
+    dispatched.clear()
+    sched.on_transfer_completed("Restore")
+    sched.on_transfer_completed("Restore")
+    sched.on_transfer_completed("Restore")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r4")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r5")
+    sched.notify_eplb_async_layer_transfer_start()
+    sched.flush()
+
+    assert len(dispatched) == 1  # CC limited to 1 again
+
+
+def test_eplb_async_migration_not_limiting_between_layers():
+    """async_migrating flag alone (without layer_transferring) does NOT limit H2D."""
+    sched, dispatched = _make_scheduler(max_concurrent_h2d=4, eplb_async_h2d_limit=1)
+
+    sched.notify_eplb_async_migration_start()
+    # No layer transfer active — full CC should be available
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r2")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r3")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r4")
+    sched.flush()
+
+    assert len(dispatched) == 4  # Full CC, no per-layer limit
+
+
+def test_eplb_async_layer_transfer_disabled_noop():
+    """Per-layer notifications are no-ops when EPLB phase-aware is disabled."""
+    sched, dispatched = _make_scheduler(
+        max_concurrent_h2d=4,
+        eplb_async_h2d_limit=1,
+        enable_eplb_phase_aware=False,
+    )
+
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r1")
+    sched.submit_transfer(None, TransferPriority.RESTORE, "Restore", req_id="r2")
+
+    sched.notify_eplb_async_layer_transfer_start()
+    sched.flush()
+
+    # Feature disabled — all should dispatch
+    assert len(dispatched) == 2
+    assert sched._eplb_async_layer_transferring is False
+    assert sched._stats["eplb_async_layer_transfers"] == 0

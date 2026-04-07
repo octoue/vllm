@@ -92,6 +92,10 @@ async def transfer_run_periodically(
                             cuda_stream.wait_event(model_state.buffer_consumed_event)
                             model_state.buffer_consumed_event = None
 
+                        # Notify PCIe scheduler: layer P2P transfer starting
+                        if state._on_async_layer_transfer_start is not None:
+                            state._on_async_layer_transfer_start()
+
                         (
                             model_state.is_unchanged,
                             model_state.is_received_locally,
@@ -109,6 +113,10 @@ async def transfer_run_periodically(
                         )
                         event = torch.cuda.Event(blocking=False)
                         cuda_stream.record_event(event)
+
+                        # Notify PCIe scheduler: layer P2P transfer done
+                        if state._on_async_layer_transfer_end is not None:
+                            state._on_async_layer_transfer_end()
                         model_state.buffer_ready_event = event
                         model_state.ep_buffer_ready = 1
                     finally:

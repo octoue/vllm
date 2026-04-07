@@ -144,6 +144,7 @@ class PCIeTransferScheduler:
         # EPLB phase state
         self._eplb_rearranging = False  # sync rearrangement in progress
         self._eplb_async_migrating = False  # async weight migration in progress
+        self._eplb_async_layer_transferring = False  # per-layer P2P active
 
         # Idle window capacity tracking
         self._idle_window_h2d_count = 0  # H2D dispatched in current IDLE window
@@ -175,6 +176,8 @@ class PCIeTransferScheduler:
             "eplb_async_cc_reductions": 0,
             "eplb_post_rearrange_flushes": 0,
             "eplb_inter_layer_flushes": 0,
+            "eplb_async_layer_transfers": 0,
+            "eplb_async_layer_flushes": 0,
         }
 
     def should_defer_prefetch(self, free_blocks: int) -> bool:
@@ -429,8 +432,8 @@ class PCIeTransferScheduler:
             else self.max_concurrent_h2d
         )
 
-        # EPLB async migration: cap concurrency
-        if self._eplb_async_migrating:
+        # EPLB async migration: cap concurrency only during active layer P2P
+        if self._eplb_async_layer_transferring:
             limit = min(limit, self.eplb_async_h2d_limit)
 
         # Snapshot load level once to prevent mid-flush drift as items drain
@@ -704,9 +707,34 @@ class PCIeTransferScheduler:
         if not self.enable_eplb_phase_aware:
             return
         self._eplb_async_migrating = False
+        self._eplb_async_layer_transferring = False
         logger.debug("EPLB async migration END — H2D CC restored to %d",
                      self.max_concurrent_h2d)
         if self._pending_h2d or self._pending_d2h:
+            self.flush()
+
+    def notify_eplb_async_layer_transfer_start(self) -> None:
+        """Called when EPLB async worker begins a single layer P2P transfer.
+
+        Reduces H2D concurrency for the duration of this layer's P2P transfer.
+        Between layers (waiting for buffer consumption), full H2D CC is available.
+        """
+        if not self.enable_eplb_phase_aware:
+            return
+        self._eplb_async_layer_transferring = True
+        self._stats["eplb_async_layer_transfers"] += 1
+
+    def notify_eplb_async_layer_transfer_end(self) -> None:
+        """Called when EPLB async worker finishes a single layer P2P transfer.
+
+        Restores full H2D concurrency and flushes any transfers that
+        accumulated during the layer transfer.
+        """
+        if not self.enable_eplb_phase_aware:
+            return
+        self._eplb_async_layer_transferring = False
+        if self._pending_h2d or self._pending_d2h:
+            self._stats["eplb_async_layer_flushes"] += 1
             self.flush()
 
     @property
@@ -727,7 +755,7 @@ class PCIeTransferScheduler:
             "idle_budget_exhausted=%d, idle_count_exhausted=%d, "
             "load_levels=[L=%d M=%d H=%d], "
             "eplb=[pauses=%d deferred=%d async_cc=%d flushes=%d "
-            "inter_layer=%d]",
+            "inter_layer=%d async_layer_xfers=%d async_layer_flushes=%d]",
             self._stats["total_submitted"],
             self._stats["prefetch_deferred"],
             self._stats["restore_dispatched"],
@@ -747,6 +775,8 @@ class PCIeTransferScheduler:
             self._stats["eplb_async_cc_reductions"],
             self._stats["eplb_post_rearrange_flushes"],
             self._stats["eplb_inter_layer_flushes"],
+            self._stats["eplb_async_layer_transfers"],
+            self._stats["eplb_async_layer_flushes"],
         )
         # Log IDLE window utilization summary
         if self._idle_window_utilizations:

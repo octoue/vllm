@@ -270,6 +270,8 @@ class EplbState:
         self._on_rearrange_end: Callable[[], None] | None = None
         self._on_async_migration_start: Callable[[], None] | None = None
         self._on_async_migration_end: Callable[[], None] | None = None
+        self._on_async_layer_transfer_start: Callable[[], None] | None = None
+        self._on_async_layer_transfer_end: Callable[[], None] | None = None
         self._on_layer_complete: Callable[[int, int], None] | None = None
 
         if self.device.type == "cuda":
@@ -283,6 +285,8 @@ class EplbState:
         on_rearrange_end: Callable[[], None] | None = None,
         on_async_migration_start: Callable[[], None] | None = None,
         on_async_migration_end: Callable[[], None] | None = None,
+        on_async_layer_transfer_start: Callable[[], None] | None = None,
+        on_async_layer_transfer_end: Callable[[], None] | None = None,
         on_layer_complete: Callable[[int, int], None] | None = None,
     ) -> None:
         """Register PCIe scheduler notification callbacks.
@@ -294,6 +298,8 @@ class EplbState:
         self._on_rearrange_end = on_rearrange_end
         self._on_async_migration_start = on_async_migration_start
         self._on_async_migration_end = on_async_migration_end
+        self._on_async_layer_transfer_start = on_async_layer_transfer_start
+        self._on_async_layer_transfer_end = on_async_layer_transfer_end
         self._on_layer_complete = on_layer_complete
         logger.info("EPLB PCIe scheduler hooks registered")
 

@@ -233,6 +233,20 @@ class OffloadingConnector(KVConnectorBase_V1):
         ) is not None:
             pcie.notify_eplb_async_migration_end()
 
+    def notify_eplb_async_layer_transfer_start(self) -> None:
+        """EPLB async worker starting a single layer P2P — reduce H2D CC."""
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.notify_eplb_async_layer_transfer_start()
+
+    def notify_eplb_async_layer_transfer_end(self) -> None:
+        """EPLB async worker finished a single layer P2P — restore H2D CC."""
+        if self.connector_worker is not None and (
+            pcie := self.connector_worker._pcie_scheduler
+        ) is not None:
+            pcie.notify_eplb_async_layer_transfer_end()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
