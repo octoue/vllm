@@ -429,14 +429,17 @@ class PCIeTransferScheduler:
             else self.max_concurrent_h2d
         )
 
-        # EPLB async migration: cap concurrency
-        if self._eplb_async_migrating:
-            limit = min(limit, self.eplb_async_h2d_limit)
+        # EPLB async migration: suppress speculative Prefetch while allowing
+        # Restore (critical path) to flow at full concurrency. Capping overall
+        # H2D concurrency here (the previous behavior) starved Restore requests
+        # without materially reducing contention with the async P2P stream.
+        suppress_prefetch_async_eplb = self._eplb_async_migrating
 
         # Snapshot load level once to prevent mid-flush drift as items drain
         snapped_load = self._compute_load_level()
 
         dispatched = False
+        deferred_prefetches: list[tuple[int, int, TransferRequest]] = []
         while self._pending_h2d:
             if self._active_h2d_count >= limit:
                 self._stats["h2d_throttled"] += 1
@@ -450,6 +453,14 @@ class PCIeTransferScheduler:
                 _, _, req = self._pending_h2d.pop(0)
             else:
                 _, _, req = heapq.heappop(self._pending_h2d)
+
+            # Defer speculative Prefetch during async EPLB migration.
+            if suppress_prefetch_async_eplb and req.label != "Restore":
+                deferred_prefetches.append((req.priority, req._sequence, req))
+                self._stats.setdefault("eplb_async_prefetch_deferred", 0)
+                self._stats["eplb_async_prefetch_deferred"] += 1
+                continue
+
             req.dispatch_phase = self._pp_phase.name
             req.dispatch_time = time.monotonic()
             self._active_h2d_count += 1
@@ -466,8 +477,18 @@ class PCIeTransferScheduler:
                     self._idle_window_h2d_count += 1
             else:
                 self._active_h2d_count -= 1
-                heapq.heappush(self._pending_h2d, (req.priority, req._sequence, req))
+                deferred_prefetches.append(
+                    (req.priority, req._sequence, req)
+                )
                 break
+
+        # Return deferred items (prefetches held during async EPLB, or a
+        # dispatch that failed) to the pending queue.
+        for item in deferred_prefetches:
+            if self.no_priority_queue:
+                self._pending_h2d.append(item)
+            else:
+                heapq.heappush(self._pending_h2d, item)
 
         return dispatched
 
@@ -686,26 +707,31 @@ class PCIeTransferScheduler:
     def notify_eplb_async_migration_start(self) -> None:
         """Called when EPLB async worker begins transferring expert weights.
 
-        Reduces H2D concurrency to eplb_async_h2d_limit (default 1) so that
-        KV cache transfers don't fully contend with the background P2P stream.
+        Switches the scheduler into "suppress Prefetch" mode: speculative
+        Prefetch transfers are deferred for the duration of the async
+        migration, while Restore (critical path) continues to flow at the
+        normal concurrency limit. This replaces the previous concurrency-cap
+        approach, which indiscriminately starved Restore.
         """
         if not self.enable_eplb_phase_aware:
             return
         self._eplb_async_migrating = True
         self._stats["eplb_async_cc_reductions"] += 1
-        logger.debug("EPLB async migration START — H2D CC reduced to %d",
-                     self.eplb_async_h2d_limit)
+        logger.debug(
+            "EPLB async migration START — Prefetch suppressed, "
+            "Restore unaffected")
 
     def notify_eplb_async_migration_end(self) -> None:
         """Called when EPLB async worker finishes all layer transfers.
 
-        Restores full H2D concurrency and flushes pending transfers.
+        Resumes normal Prefetch dispatching and flushes deferred transfers.
         """
         if not self.enable_eplb_phase_aware:
             return
         self._eplb_async_migrating = False
-        logger.debug("EPLB async migration END — H2D CC restored to %d",
-                     self.max_concurrent_h2d)
+        logger.debug(
+            "EPLB async migration END — flushing deferred prefetches "
+            "(pending H2D=%d)", len(self._pending_h2d))
         if self._pending_h2d or self._pending_d2h:
             self.flush()
 
