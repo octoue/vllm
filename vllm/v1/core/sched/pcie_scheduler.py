@@ -241,6 +241,13 @@ class PCIeTransferScheduler:
             load_override: If provided, use this load level instead of
                 recomputing. Prevents mid-flush level drift as items drain.
         """
+        # The IDLE-window budget is a PP-aware mechanism. In pure EP runs
+        # there is no PP and notify_pp_phase_change() is never called, so
+        # _pp_phase stays at IDLE forever and _idle_window_h2d_count is
+        # never reset. Without this guard, the counter exhausts after
+        # max_h2d_per_idle_window dispatches and H2D is blocked permanently.
+        if not self.enable_pp_phase_aware:
+            return True
         if self._pp_phase != PPPhase.IDLE:
             return True
 
