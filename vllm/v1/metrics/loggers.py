@@ -518,6 +518,71 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         #
+        # Prefetch admission outcomes (LLM-Prefetch).
+        # Each counter is the cumulative number of prefetch requests whose
+        # admission resolved to the named outcome.
+        #
+        counter_prefetch_gpu_hits = self._counter_cls(
+            name="vllm:prefetch_gpu_hits_total",
+            documentation=(
+                "Prefetch requests that hit the GPU prefix cache and finished "
+                "without any PCIe transfer."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefetch_gpu_hits = make_per_engine(
+            counter_prefetch_gpu_hits, engine_indexes, model_name
+        )
+
+        counter_prefetch_cpu_hits = self._counter_cls(
+            name="vllm:prefetch_cpu_hits_total",
+            documentation=(
+                "Prefetch requests that triggered an H2D load from the CPU "
+                "offload cache."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefetch_cpu_hits = make_per_engine(
+            counter_prefetch_cpu_hits, engine_indexes, model_name
+        )
+
+        counter_prefetch_no_hits = self._counter_cls(
+            name="vllm:prefetch_no_hits_total",
+            documentation=(
+                "Prefetch requests discarded because no prefix was found in "
+                "either GPU or CPU cache."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefetch_no_hits = make_per_engine(
+            counter_prefetch_no_hits, engine_indexes, model_name
+        )
+
+        counter_prefetch_deferred = self._counter_cls(
+            name="vllm:prefetch_deferred_total",
+            documentation=(
+                "Prefetch requests rejected by admission control (free-block "
+                "threshold or quota ratio)."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefetch_deferred = make_per_engine(
+            counter_prefetch_deferred, engine_indexes, model_name
+        )
+
+        counter_prefetch_expired = self._counter_cls(
+            name="vllm:prefetch_expired_total",
+            documentation=(
+                "Prefetched blocks reclaimed because their TTL elapsed "
+                "without being consumed by any real request."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefetch_expired = make_per_engine(
+            counter_prefetch_expired, engine_indexes, model_name
+        )
+
+        #
         # External - KV connector prefix cache
         #
 
@@ -1045,6 +1110,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.counter_prefix_cache_hits[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.hits
+            )
+
+            self.counter_prefetch_gpu_hits[engine_idx].inc(
+                scheduler_stats.prefetch_gpu_hits
+            )
+            self.counter_prefetch_cpu_hits[engine_idx].inc(
+                scheduler_stats.prefetch_cpu_hits
+            )
+            self.counter_prefetch_no_hits[engine_idx].inc(
+                scheduler_stats.prefetch_no_hits
+            )
+            self.counter_prefetch_deferred[engine_idx].inc(
+                scheduler_stats.prefetch_deferred
+            )
+            self.counter_prefetch_expired[engine_idx].inc(
+                scheduler_stats.prefetch_expired
             )
 
             if scheduler_stats.connector_prefix_cache_stats is not None:

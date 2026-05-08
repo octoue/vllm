@@ -188,6 +188,7 @@ class Scheduler(SchedulerInterface):
         self._prefetch_cpu_hits: int = 0
         self._prefetch_no_hits: int = 0
         self._prefetch_deferred: int = 0
+        self._prefetch_expired: int = 0
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -363,6 +364,12 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+
+        # Sweep expired prefetch blocks at the head of every schedule cycle.
+        # This is the layer-1 reclaim path of Algorithm 1 (tiered eviction):
+        # blocks that were prefetched but not consumed within prefetch_ttl_ms
+        # are returned to the free queue before any new allocation runs.
+        self._sweep_expired_prefetch_blocks()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -845,9 +852,11 @@ class Scheduler(SchedulerInterface):
 
                 # Mark newly allocated blocks for prefetch requests.
                 if request.prefetch_only:
+                    now_ms = int(time.monotonic() * 1000)
                     for group_blocks in new_blocks.blocks:
                         for block in group_blocks:
                             block.is_prefetched = True
+                            block.prefetched_at_ms = now_ms
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1879,6 +1888,46 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
+    def _sweep_expired_prefetch_blocks(self) -> None:
+        """Reclaim prefetch blocks whose TTL has elapsed (Algorithm 1 layer 1).
+
+        Called once per schedule() cycle. A no-op when prefetch_ttl_ms <= 0.
+        Expired blocks are evicted from the prefix-cache hash table and
+        returned to the free queue without being touched by any real request,
+        making them available for both regular allocation and new prefetch
+        admissions in the same cycle.
+        """
+        ttl_ms = self.scheduler_config.prefetch_ttl_ms
+        if ttl_ms <= 0:
+            return
+        block_pool = self.kv_cache_manager.block_pool
+        # Defensive: some hybrid managers may not expose the legacy block_pool
+        # attribute; in that case skip the sweep silently.
+        if not hasattr(block_pool, "get_expired_prefetch_blocks"):
+            return
+        now_ms = int(time.monotonic() * 1000)
+        expired = block_pool.get_expired_prefetch_blocks(now_ms, ttl_ms)
+        if not expired:
+            return
+        # Evict from the prefix-cache hash table so the stale prefix cannot
+        # silently rehydrate a future request, then clear the prefetch flag
+        # and timestamp. The block is already in the free queue (ref_cnt=0)
+        # so no explicit insert is needed.
+        evict_ids: set[int] = set()
+        for block in expired:
+            if block.block_hash is not None:
+                evict_ids.add(block.block_id)
+            block.is_prefetched = False
+            block.prefetched_at_ms = 0
+        if evict_ids:
+            block_pool.evict_blocks(evict_ids)
+        self._prefetch_expired += len(expired)
+        logger.debug(
+            "Prefetch TTL sweep: reclaimed %d expired blocks (ttl_ms=%d)",
+            len(expired),
+            ttl_ms,
+        )
+
     def _finish_prefetch_request(self, request: Request) -> None:
         """Finish a prefetch_only request without GPU compute.
 
@@ -2011,10 +2060,12 @@ class Scheduler(SchedulerInterface):
         prefetch_cpu_hits = self._prefetch_cpu_hits
         prefetch_no_hits = self._prefetch_no_hits
         prefetch_deferred = self._prefetch_deferred
+        prefetch_expired = self._prefetch_expired
         self._prefetch_gpu_hits = 0
         self._prefetch_cpu_hits = 0
         self._prefetch_no_hits = 0
         self._prefetch_deferred = 0
+        self._prefetch_expired = 0
 
         return SchedulerStats(
             num_running_reqs=len(self.running),
@@ -2032,6 +2083,7 @@ class Scheduler(SchedulerInterface):
             prefetch_cpu_hits=prefetch_cpu_hits,
             prefetch_no_hits=prefetch_no_hits,
             prefetch_deferred=prefetch_deferred,
+            prefetch_expired=prefetch_expired,
         )
 
     def _get_encoder_cache_usage(self) -> float:

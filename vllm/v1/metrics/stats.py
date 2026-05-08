@@ -195,6 +195,7 @@ class SchedulerStats:
     prefetch_cpu_hits: int = 0
     prefetch_no_hits: int = 0
     prefetch_deferred: int = 0
+    prefetch_expired: int = 0
 
 
 @dataclass

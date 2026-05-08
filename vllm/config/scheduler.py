@@ -158,6 +158,15 @@ class SchedulerConfig:
     blocks. When exceeded, new prefetch requests are rejected
     (non-preemptive admission control). Set to 0 to disable quota."""
 
+    prefetch_ttl_ms: int = Field(default=60_000, ge=0)
+    """Time-to-live (in milliseconds) for an unconsumed prefetch block.
+    Blocks marked as prefetched and not touched by any real request within
+    this window are reclaimed first by the tiered eviction policy.
+    Set to 0 to disable TTL-based reclamation (only quota + LRU + OOM-tier
+    eviction remain active). Default 60s aligns with the assumption that
+    a user who has not followed up within 1 minute likely abandoned the
+    turn, freeing speculatively held GPU blocks."""
+
     enable_pp_phase_aware: bool = True
     """Align H2D transfers with PP pipeline idle windows (PCIe scheduling only)."""
 

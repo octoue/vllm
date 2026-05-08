@@ -128,6 +128,12 @@ class KVCacheBlock:
     # Used for quota tracking and statistics; cleared on eviction or touch.
     is_prefetched: bool = False
 
+    # Monotonic-ms timestamp of the moment a prefetch request first allocated
+    # this block. Zero for non-prefetch blocks. Used by the tiered eviction
+    # policy to identify expired prefetch blocks (Algorithm 1 layer 1).
+    # Cleared (set to 0) when the block is consumed by a real request or evicted.
+    prefetched_at_ms: int = 0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -143,6 +149,7 @@ class KVCacheBlock:
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
         self.is_prefetched = False
+        self.prefetched_at_ms = 0
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__

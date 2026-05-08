@@ -386,6 +386,7 @@ class BlockPool:
             # A real request consuming a prefetched block "promotes" it
             # to a normal active block.
             block.is_prefetched = False
+            block.prefetched_at_ms = 0
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -477,6 +478,37 @@ class BlockPool:
             1 for b in self.blocks
             if b.is_prefetched and b.ref_cnt > 0
         )
+
+    def get_expired_prefetch_blocks(
+        self, now_ms: int, ttl_ms: int
+    ) -> list[KVCacheBlock]:
+        """Return prefetch blocks whose TTL has elapsed without being touched.
+
+        A block is considered expired when:
+          - is_prefetched is True
+          - ref_cnt == 0 (no real request currently uses it)
+          - prefetched_at_ms > 0 (TTL is tracked)
+          - now_ms - prefetched_at_ms > ttl_ms
+
+        Returned blocks are sorted by ascending prefetched_at_ms so that the
+        oldest expired blocks are reclaimed first (Algorithm 1 layer 1).
+
+        Args:
+            now_ms: Current monotonic timestamp in milliseconds.
+            ttl_ms: TTL window in milliseconds. ttl_ms <= 0 disables TTL
+                and yields an empty list.
+        """
+        if ttl_ms <= 0:
+            return []
+        expired = [
+            b for b in self.blocks
+            if b.is_prefetched
+            and b.ref_cnt == 0
+            and b.prefetched_at_ms > 0
+            and (now_ms - b.prefetched_at_ms) > ttl_ms
+        ]
+        expired.sort(key=lambda b: b.prefetched_at_ms)
+        return expired
 
     def get_usage(self) -> float:
         """Get the KV cache usage.
