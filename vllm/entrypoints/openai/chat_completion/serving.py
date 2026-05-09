@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -90,6 +91,36 @@ from vllm.v1.sample.logits_processor import validate_logits_processors_parameter
 
 logger = init_logger(__name__)
 
+_PREFETCH_RATE_LIMIT = float(os.environ.get("VLLM_PREFETCH_RATE_LIMIT", "0"))
+
+
+class _PrefetchRateLimiter:
+    """Token-bucket rate limiter for prefetch requests.
+
+    Safe without locks because the asyncio event loop is single-threaded.
+    """
+
+    def __init__(self, rate: float):
+        self.rate = rate
+        self.tokens = rate
+        self.last_refill = time.monotonic()
+        self.rejected = 0
+
+    def allow(self) -> bool:
+        if self.rate <= 0:
+            return True
+        now = time.monotonic()
+        self.tokens = min(
+            self.rate,
+            self.tokens + (now - self.last_refill) * self.rate,
+        )
+        self.last_refill = now
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        self.rejected += 1
+        return False
+
 
 class OpenAIServingChat(OpenAIServing):
     def __init__(
@@ -176,6 +207,10 @@ class OpenAIServingChat(OpenAIServing):
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
+
+        self._prefetch_limiter = _PrefetchRateLimiter(_PREFETCH_RATE_LIMIT)
+        if _PREFETCH_RATE_LIMIT > 0:
+            logger.info("Prefetch rate limit: %.1f req/s", _PREFETCH_RATE_LIMIT)
 
     async def warmup(self) -> None:
         """
@@ -329,6 +364,23 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        if request.prefetch and not self._prefetch_limiter.allow():
+            rid = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+            usage = UsageInfo(
+                prompt_tokens=0, total_tokens=0, completion_tokens=0,
+                prompt_tokens_details=PromptTokenUsageInfo(cached_tokens=0),
+            )
+            return ChatCompletionResponse(
+                id=rid, created=int(time.time()),
+                model=request.model,
+                choices=[ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=None),
+                    finish_reason="stop",
+                )],
+                usage=usage,
+            )
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
