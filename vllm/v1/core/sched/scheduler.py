@@ -190,6 +190,15 @@ class Scheduler(SchedulerInterface):
         self._prefetch_deferred: int = 0
         self._prefetch_expired: int = 0
 
+        # CPU-hit prefetch coalescing (de-bounce). Keyed by a session hash
+        # derived from the request's prefix-token list; value is
+        # (pending_request, deadline_ms). Within the coalesce window, a
+        # newer CPU-hit prefetch arriving on the same session_key cancels
+        # the older pending one. When the deadline elapses, the pending
+        # request is admitted to the real prefetch pipeline.
+        self._prefetch_pending: dict[int, tuple["Request", float]] = {}
+        self._prefetch_coalesced: int = 0  # cumulative cancellations
+
         # Encoder-related.
         # Calculate encoder cache size if applicable
         self.supports_mm_inputs = mm_registry.supports_multimodal_inputs(
@@ -370,6 +379,11 @@ class Scheduler(SchedulerInterface):
         # blocks that were prefetched but not consumed within prefetch_ttl_ms
         # are returned to the free queue before any new allocation runs.
         self._sweep_expired_prefetch_blocks()
+
+        # Release any coalesced-prefetch pending requests whose de-bounce
+        # window has elapsed: move them back to the head of the waiting
+        # queue so the normal CPU-hit dispatch path picks them up below.
+        self._release_pending_prefetches()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -719,6 +733,40 @@ class Scheduler(SchedulerInterface):
                                 request.num_cached_tokens = 0
                                 self._finish_prefetch_request(request)
                                 continue
+                        # CPU offload hit.  Before letting it consume PCIe,
+                        # try to coalesce it against any pending prefetch
+                        # from the same session: in burst-then-abandon
+                        # patterns the latest request supersedes earlier
+                        # ones (their prefixes are subsumed by the newest),
+                        # so we hold the request for prefetch_coalesce_window_ms
+                        # and let any newer arrival on the same session_key
+                        # cancel it. Requests previously released by
+                        # _release_pending_prefetches() carry the
+                        # _prefetch_coalesce_admitted marker and skip this.
+                        coalesce_window_ms = (
+                            self.scheduler_config.prefetch_coalesce_window_ms
+                        )
+                        admitted = getattr(
+                            request, "_prefetch_coalesce_admitted", False
+                        )
+                        if coalesce_window_ms > 0 and not admitted:
+                            session_key = self._prefetch_session_key(request)
+                            now_ms = time.monotonic() * 1000.0
+                            existing = self._prefetch_pending.get(session_key)
+                            if existing is not None:
+                                old_req, _deadline = existing
+                                # Cancel the stale pending prefetch.
+                                self._prefetch_coalesced += 1
+                                old_req.num_cached_tokens = 0
+                                self._finish_prefetch_request(old_req)
+                            # Park the current request and let the
+                            # coalesce window run.
+                            self._prefetch_pending[session_key] = (
+                                request,
+                                now_ms + coalesce_window_ms,
+                            )
+                            self.waiting.pop_request()
+                            continue
                         # CPU offload hit: let it proceed to allocate + load.
                         self._prefetch_cpu_hits += 1
                         logger.info(
@@ -1887,6 +1935,45 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+
+    @staticmethod
+    def _prefetch_session_key(request: "Request") -> int:
+        """Session identifier for prefetch coalescing.
+
+        We use the hash of the request's prompt-token prefix (first 64
+        tokens) as a session key. Two prefetches from the same chat /
+        conversation thread almost certainly share a long shared prefix
+        (system prompt + early user/assistant turns), so their first 64
+        tokens collide deterministically, while unrelated chats almost
+        never do. Falls back to id(request) when the prompt is missing.
+        """
+        tokens = request.prompt_token_ids
+        if not tokens:
+            return id(request)
+        head = tuple(tokens[:64]) if len(tokens) > 64 else tuple(tokens)
+        return hash(head)
+
+    def _release_pending_prefetches(self) -> None:
+        """Admit any coalesced-pending prefetch whose window has elapsed.
+
+        Each released request is marked with `_prefetch_coalesce_admitted`
+        so that when it re-enters the CPU-hit dispatch path it bypasses
+        the coalescing check and proceeds to allocate + load. No-op when
+        the coalesce window is disabled or the pending map is empty.
+        """
+        if not self._prefetch_pending:
+            return
+        now_ms = time.monotonic() * 1000.0
+        released: list[int] = []
+        for key, (req, deadline) in self._prefetch_pending.items():
+            if now_ms >= deadline:
+                req._prefetch_coalesce_admitted = True
+                # Push to the front of the waiting queue so the new
+                # schedule cycle picks it up immediately.
+                self.waiting.prepend_request(req)
+                released.append(key)
+        for key in released:
+            del self._prefetch_pending[key]
 
     def _sweep_expired_prefetch_blocks(self) -> None:
         """Reclaim prefetch blocks whose TTL has elapsed (Algorithm 1 layer 1).

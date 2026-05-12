@@ -585,6 +585,7 @@ class EngineArgs:
     prefetch_block_threshold: int = SchedulerConfig.prefetch_block_threshold
     max_prefetch_block_ratio: float = SchedulerConfig.max_prefetch_block_ratio
     prefetch_ttl_ms: int = SchedulerConfig.prefetch_ttl_ms
+    prefetch_coalesce_window_ms: int = SchedulerConfig.prefetch_coalesce_window_ms
     enable_pp_phase_aware: bool = SchedulerConfig.enable_pp_phase_aware
     max_queue_wait_ms: int = SchedulerConfig.max_queue_wait_ms
 
@@ -1179,6 +1180,10 @@ class EngineArgs:
             "--prefetch-ttl-ms", **scheduler_kwargs["prefetch_ttl_ms"]
         )
         scheduler_group.add_argument(
+            "--prefetch-coalesce-window-ms",
+            **scheduler_kwargs["prefetch_coalesce_window_ms"],
+        )
+        scheduler_group.add_argument(
             "--enable-pp-phase-aware", **scheduler_kwargs["enable_pp_phase_aware"]
         )
         scheduler_group.add_argument(
@@ -1718,6 +1723,7 @@ class EngineArgs:
             prefetch_block_threshold=self.prefetch_block_threshold,
             max_prefetch_block_ratio=self.max_prefetch_block_ratio,
             prefetch_ttl_ms=self.prefetch_ttl_ms,
+            prefetch_coalesce_window_ms=self.prefetch_coalesce_window_ms,
             enable_pp_phase_aware=(self.enable_pp_phase_aware
                                    and envs.VLLM_PCIE_PP_PHASE_AWARE),
             max_queue_wait_ms=self.max_queue_wait_ms,

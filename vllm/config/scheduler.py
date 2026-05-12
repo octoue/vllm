@@ -167,6 +167,18 @@ class SchedulerConfig:
     a user who has not followed up within 1 minute likely abandoned the
     turn, freeing speculatively held GPU blocks."""
 
+    prefetch_coalesce_window_ms: int = Field(default=80, ge=0)
+    """De-bounce / coalescing window (in milliseconds) for CPU-hit prefetch
+    requests. Within this window, if a new CPU-hit prefetch arrives that
+    shares a session-key (prefix-token hash) with a pending prefetch, the
+    older one is cancelled and superseded by the new one. The new one is
+    held in the pending slot until the window elapses, then admitted to
+    the real prefetch pipeline. Targets the "burst-then-abandon" pattern
+    where front-ends fire many speculative prefetches that quickly become
+    stale (e.g. typing, editing, retracting). NO_HIT and GPU_HIT prefetches
+    are unaffected — they neither cost PCIe nor block on coalescing.
+    Set to 0 to disable coalescing entirely."""
+
     enable_pp_phase_aware: bool = True
     """Align H2D transfers with PP pipeline idle windows (PCIe scheduling only)."""
 
